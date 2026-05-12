@@ -110,7 +110,7 @@ function startGrokAudio() {
         '-f', 'pulse', '-i', 'DiscordSink.monitor',
         '-fflags', 'nobuffer+discardcorrupt',
         '-flags', 'low_delay',
-        '-af', 'aresample=async=1000',
+        '-af', 'aresample=async=1000,aresample=48000',  // ✅ force 48000Hz output
         '-ac', '2', '-ar', '48000',
         '-f', 's16le', '-acodec', 'pcm_s16le', 'pipe:1'
     ]);
@@ -172,7 +172,10 @@ function setupVoiceInput(receiver) {
         ffmpegIn = spawn('ffmpeg', [
             '-loglevel', 'warning',
             '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
-            '-f', 'pulse', 'DiscordMic'
+            '-af', 'aresample=48000',      // ✅ explicit resample
+            '-f', 'pulse',
+            '-device', 'DiscordMic',       // ✅ explicit sink device
+            'default'
         ]);
         ffmpegIn.stderr.on('data', d => {
             const m = d.toString().trim();
