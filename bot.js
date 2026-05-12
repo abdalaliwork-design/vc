@@ -1,7 +1,7 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
 const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-plugin-stealth')(); // تم تصحيح اسم الحزمة هنا
+const stealth = require('puppeteer-extra-plugin-stealth')();
 const { spawn } = require('child_process');
 const fs = require('fs');
 
@@ -24,31 +24,56 @@ let ffmpegProcess = null;
 let connection = null;
 let player = null;
 
-client.on('ready', () => {
+// تعريف أوامر السلاش (Slash Commands)
+const commands =[
+    {
+        name: 'start',
+        description: 'يبدأ تشغيل متصفح Grok وبث الصوت إلى القناة الصوتية 🎙️',
+    },
+    {
+        name: 'stop',
+        description: 'يوقف الجلسة ويغلق المتصفح لتوفير الموارد 🛑',
+    }
+];
+
+client.on('ready', async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
+
+    // تسجيل الأوامر في ديسكورد لتظهر في القائمة
+    try {
+        console.log('🔄 جاري تسجيل أوامر السلاش (Slash Commands)...');
+        await client.application.commands.set(commands);
+        console.log('✅ تم تسجيل الأوامر بنجاح! ستظهر في ديسكورد الآن.');
+    } catch (error) {
+        console.error('❌ خطأ في تسجيل الأوامر:', error);
+    }
 });
 
-client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
+// التعامل مع أوامر السلاش عند الضغط عليها
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
 
     // --- أمر البدء ---
-    if (message.content === '/start') {
-        const voiceChannel = message.member?.voice.channel;
+    if (interaction.commandName === 'start') {
+        const voiceChannel = interaction.member?.voice.channel;
+        
+        // التحقق من وجود المستخدم في قناة صوتية (يظهر الخطأ له فقط)
         if (!voiceChannel) {
-            return message.reply('❌ يجب أن تكون في قناة صوتية أولاً!');
+            return interaction.reply({ content: '❌ يجب أن تكون في قناة صوتية أولاً!', ephemeral: true });
         }
         if (browser) {
-            return message.reply('⚠️ جلسة Grok تعمل بالفعل!');
+            return interaction.reply({ content: '⚠️ جلسة Grok تعمل بالفعل!', ephemeral: true });
         }
 
-        const msg = await message.reply('🔄 جاري بدء محرك الاستخراج وتهيئة المتصفح...');
+        // الرد الأولي (لأن ديسكورد يتطلب رداً خلال 3 ثوانٍ)
+        await interaction.reply('🔄 جاري بدء محرك الاستخراج وتهيئة المتصفح...');
 
         try {
             // 1. الاتصال بالقناة الصوتية لديسكورد
             connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
-                guildId: message.guild.id,
-                adapterCreator: message.guild.voiceAdapterCreator,
+                guildId: interaction.guild.id,
+                adapterCreator: interaction.guild.voiceAdapterCreator,
             });
 
             // 2. تشغيل المتصفح (Headless: false) داخل شاشة Xvfb الوهمية لضمان عمل الصوت
@@ -73,7 +98,7 @@ client.on('messageCreate', async (message) => {
                     console.log('✅ تم جلب الكوكيز من متغيرات Railway بنجاح.');
                 } catch (err) {
                     console.error('❌ خطأ في تحليل JSON الخاص بالكوكيز من المتغيرات!', err);
-                    message.channel.send('⚠️ خطأ في قراءة متغير GROK_COOKIES، تأكد من صحة الكود المنسوخ.');
+                    interaction.channel.send('⚠️ خطأ في قراءة متغير GROK_COOKIES، تأكد من صحة الكود المنسوخ.');
                 }
             } else if (fs.existsSync('./cookies.json')) {
                 cookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
@@ -83,16 +108,14 @@ client.on('messageCreate', async (message) => {
             if (cookies) {
                 await context.addCookies(cookies);
             } else {
-                message.channel.send('⚠️ تنبيه: لم يتم العثور على كوكيز (لا في Railway ولا في الملف). قد يُطلب تسجيل الدخول يدوياً.');
+                interaction.channel.send('⚠️ تنبيه: لم يتم العثور على كوكيز (لا في Railway ولا في الملف). قد يُطلب تسجيل الدخول يدوياً.');
             }
 
             // ضمان فتح Tab واحد فقط لتوفير استهلاك الرام (< 1GB)
             page = await context.newPage();
-            // الدخول إلى الرابط المباشر لـ Grok
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
 
             // 4. تشغيل FFmpeg لسحب الصوت من الـ Monitor الخاص بـ DiscordSink
-            // إعدادات مصممة خصيصاً لتقليل الـ Latency لأقل من ثانية
             ffmpegProcess = spawn('ffmpeg',[
                 '-f', 'pulse',
                 '-i', 'DiscordSink.monitor', // التقاط الصوت من المخرج الوهمي
@@ -117,19 +140,20 @@ client.on('messageCreate', async (message) => {
             player.play(resource);
             connection.subscribe(player);
 
-            msg.edit('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل والصوت يتم بثه الآن إلى القناة.');
+            // تعديل الرسالة لتأكيد اكتمال الربط
+            await interaction.editReply('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل (على grok.com) والصوت يتم بثه الآن إلى القناة.');
 
         } catch (error) {
             console.error(error);
-            msg.edit('❌ حدث خطأ أثناء تشغيل الجلسة.');
+            await interaction.editReply('❌ حدث خطأ أثناء تشغيل الجلسة.');
         }
     }
 
     // --- أمر الإيقاف ---
-    if (message.content === '/stop') {
-        if (!browser) return message.reply('⚠️ لا توجد جلسة تعمل حالياً.');
+    if (interaction.commandName === 'stop') {
+        if (!browser) return interaction.reply({ content: '⚠️ لا توجد جلسة تعمل حالياً.', ephemeral: true });
 
-        message.reply('🛑 جاري إيقاف الجلسة وتفريغ الذاكرة (RAM)...');
+        await interaction.reply('🛑 جاري إيقاف الجلسة وتفريغ الذاكرة (RAM)...');
 
         // إيقاف FFmpeg
         if (ffmpegProcess) {
@@ -154,7 +178,7 @@ client.on('messageCreate', async (message) => {
             player = null;
         }
 
-        message.channel.send('✅ تم إغلاق كل شيء بنجاح وتوفير الموارد.');
+        await interaction.editReply('✅ تم إغلاق كل شيء بنجاح وتوفير الموارد.');
     }
 });
 
