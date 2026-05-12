@@ -3,7 +3,7 @@
 echo "Cleaning up old locks..."
 rm -f /tmp/.X99-lock
 rm -rf /tmp/runtime-node/*
-killall Xvfb pulseaudio 2>/dev/null || true
+killall Xvfb pulseaudio x11vnc websockify 2>/dev/null || true
 
 echo "Starting Xvfb (Virtual Display)..."
 export DISPLAY=:99
@@ -22,6 +22,50 @@ pactl load-module module-null-sink sink_name=DiscordMic sink_properties=device.d
 
 pactl set-default-sink DiscordSink
 pactl set-default-source DiscordMic.monitor
+
+# ─── noVNC Setup ─────────────────────────────────────────────────────────────
+NOVNC_PORT=${NOVNC_PORT:-6080}
+VNC_PORT=5900
+VNC_PASS=${VNC_PASSWORD:-"botpass123"}
+
+echo "Starting x11vnc on port $VNC_PORT..."
+x11vnc -display :99 \
+    -nopw \
+    -forever \
+    -shared \
+    -rfbport $VNC_PORT \
+    -noxdamage \
+    -quiet \
+    -bg 2>/dev/null
+
+sleep 1
+
+echo "Starting noVNC on port $NOVNC_PORT..."
+if [ -d "/opt/novnc" ]; then
+    websockify --web /opt/novnc/utils/novnc_proxy --wrap-mode=ignore $NOVNC_PORT localhost:$VNC_PORT &
+    echo "✅ noVNC ready → http://localhost:$NOVNC_PORT/vnc.html"
+elif command -v websockify &>/dev/null; then
+    # Try to find noVNC share dir
+    NOVNC_SHARE=$(find /usr -name "vnc.html" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+    if [ -n "$NOVNC_SHARE" ]; then
+        websockify --web "$NOVNC_SHARE" $NOVNC_PORT localhost:$VNC_PORT &
+        echo "✅ noVNC ready → http://localhost:$NOVNC_PORT/vnc.html"
+    else
+        websockify $NOVNC_PORT localhost:$VNC_PORT &
+        echo "✅ websockify VNC proxy on port $NOVNC_PORT (no web UI)"
+    fi
+else
+    echo "⚠️  noVNC/websockify not installed — VNC only on port $VNC_PORT"
+    echo "    Install with: apt-get install novnc websockify x11vnc"
+fi
+
+echo ""
+echo "═══════════════════════════════════════════"
+echo "  🖥️  noVNC:  http://YOUR_HOST:$NOVNC_PORT/vnc.html"
+echo "  🖥️  VNC:    vnc://YOUR_HOST:$VNC_PORT"
+echo "  🎤  Listening ONLY to user: 712321588342816879"
+echo "═══════════════════════════════════════════"
+echo ""
 
 echo "Starting Node.js Bot..."
 node bot.js
