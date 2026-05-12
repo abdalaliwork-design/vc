@@ -37,6 +37,7 @@ let player          = null;
 let grokPassthrough = null;
 let silenceInterval = null;   // ✅ keeps stream alive between FFmpeg chunks
 let isIdleBusy      = false;  // ✅ re-entrancy guard for Idle handler
+let voiceInputReady = false;  // ✅ module-level guard against double-init
 let sessionUserId   = null;
 let statusMessage   = null;   // live voice indicator message
 let statusChannel   = null;   // channel to post indicator in
@@ -81,8 +82,9 @@ function startGrokAudio() {
         '-loglevel', 'warning',
         '-f', 'pulse',
         '-i', 'DiscordSink.monitor',
-        '-fflags', 'nobuffer',
+        '-fflags', 'nobuffer+discardcorrupt',
         '-flags', 'low_delay',
+        '-af', 'aresample=async=1000',
         '-ac', '2',
         '-ar', '48000',
         '-f', 's16le',
@@ -341,7 +343,7 @@ client.on('interactionCreate', async (interaction) => {
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
             console.log('✅ Grok محمّل.');
 
-            let voiceInputReady = false;
+            let voiceReadyTimer = null;
             const onReady = () => {
                 if (voiceInputReady) return;
                 voiceInputReady = true;
@@ -357,7 +359,7 @@ client.on('interactionCreate', async (interaction) => {
                 onReady();
             } else {
                 // Fallback: force-init after 5 s regardless
-                setTimeout(() => {
+                voiceReadyTimer = setTimeout(() => {
                     if (!voiceInputReady && connection) {
                         console.warn('⚠️ Ready لم يصل — تهيئة إجبارية');
                         onReady();
@@ -399,6 +401,7 @@ client.on('interactionCreate', async (interaction) => {
 function cleanupAll() {
     if (silenceTimeout)  { clearTimeout(silenceTimeout); silenceTimeout = null; }
     if (silenceInterval)  { clearInterval(silenceInterval); silenceInterval = null; }
+    voiceInputReady = false;
     if (ffmpegOut)        { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     if (ffmpegIn)         { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
     if (grokPassthrough)  { grokPassthrough.destroy(); grokPassthrough = null; }
