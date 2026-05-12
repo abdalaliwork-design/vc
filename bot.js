@@ -72,6 +72,29 @@ async function sendTextToGrok(text) {
     isSendingToGrok = true;
     console.log(`📨 [GROK] إرسال: "${text}"`);
     try {
+        // ✅ If in voice mode, exit it first so textarea appears
+        const inVoiceMode = await page.evaluate(() => {
+            const ta = document.querySelector('textarea');
+            return !ta || ta.offsetParent === null;
+        });
+        if (inVoiceMode) {
+            console.log('🔄 الخروج من وضع الصوت مؤقتاً لإرسال النص...');
+            // Press Escape or click stop voice button
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(800);
+            // Also try clicking any "exit voice" or "stop" button
+            await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                for (const btn of btns) {
+                    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (label.includes('exit voice') || label.includes('stop voice') || label.includes('cancel')) {
+                        btn.click(); return;
+                    }
+                }
+            });
+            await page.waitForTimeout(800);
+        }
+
         const inputSelectors = [
             'textarea[placeholder]',
             'div[contenteditable="true"]',
@@ -81,7 +104,7 @@ async function sendTextToGrok(text) {
         let inputEl = null;
         for (const sel of inputSelectors) {
             try {
-                inputEl = await page.waitForSelector(sel, { timeout: 3000 });
+                inputEl = await page.waitForSelector(sel, { timeout: 3000, state: 'visible' });
                 if (inputEl) { console.log(`✅ وجد المربع: ${sel}`); break; }
             } catch { /* try next */ }
         }
@@ -94,6 +117,17 @@ async function sendTextToGrok(text) {
         await page.keyboard.type(text, { delay: 30 });
         await page.keyboard.press('Enter');
         console.log('✅ [GROK] تم الإرسال — Grok سيرد بصوته');
+
+        // ✅ Re-enter voice mode after sending text
+        await page.waitForTimeout(1500);
+        console.log('🔄 العودة لوضع الصوت...');
+        await page.keyboard.down('Control');
+        await page.keyboard.down('Shift');
+        await page.keyboard.press('O');
+        await page.keyboard.up('Shift');
+        await page.keyboard.up('Control');
+        console.log('✅ تم إعادة تفعيل وضع الصوت');
+
     } catch (err) {
         console.error('❌ sendTextToGrok:', err.message);
     } finally {
@@ -434,6 +468,25 @@ client.on('interactionCreate', async (interaction) => {
             console.log('✅ Grok محمّل.');
 
             await activateGrokVoiceMode();
+
+            // ✅ If button click didn't activate voice mode, use keyboard shortcut Ctrl+Shift+O
+            await page.waitForTimeout(1500);
+            const stillTextMode = await page.evaluate(() => {
+                const ta = document.querySelector('textarea');
+                return ta && ta.offsetParent !== null; // textarea visible = still text mode
+            });
+            if (stillTextMode) {
+                console.warn('⚠️ لا يزال في وضع النص — تجربة Ctrl+Shift+O');
+                await page.keyboard.down('Control');
+                await page.keyboard.down('Shift');
+                await page.keyboard.press('O');
+                await page.keyboard.up('Shift');
+                await page.keyboard.up('Control');
+                await page.waitForTimeout(2000);
+                console.log('✅ تم إرسال Ctrl+Shift+O');
+            } else {
+                console.log('✅ وضع الصوت مفعّل بنجاح');
+            }
 
             // ─── Voice connection ─────────────────────────────────────────
             let voiceReadyTimer = null;
