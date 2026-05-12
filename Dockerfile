@@ -25,6 +25,9 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
+# إصلاح تحذير Xvfb الخاص بـ X11
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
 # إضافة المستخدم node (الافتراضي) إلى مجموعة audio
 RUN usermod -aG audio node
 
@@ -39,9 +42,12 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# تثبيت متصفح Chromium الخاص بـ Playwright (للمستخدم الجذر لتوفير الصلاحيات)
+# 🔴 الحل الجذري لمشكلة المتصفح 🔴
+# إجبار Playwright على تثبيت المتصفح في مسار عام ليتمكن المستخدم node من قراءته
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx playwright install chromium
 RUN npx playwright install-deps chromium
+RUN chmod -R 777 /ms-playwright
 
 # نسخ باقي ملفات المشروع
 COPY . .
