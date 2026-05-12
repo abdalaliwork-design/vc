@@ -1,7 +1,6 @@
-# استخدام قاعدة Node 18 Bullseye
 FROM node:18-bullseye
 
-# تحديث النظام وتثبيت الحزم الأساسية (Xvfb, PulseAudio, FFmpeg, Playwright Deps)
+# تحديث النظام وتثبيت الحزم الأساسية
 RUN apt-get update && apt-get install -y \
     xvfb \
     pulseaudio \
@@ -25,38 +24,31 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# إصلاح تحذير Xvfb الخاص بـ X11
+# إصلاح مجلد X11
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# إضافة المستخدم node (الافتراضي) إلى مجموعة audio
+# إضافة المستخدم node إلى مجموعة audio
 RUN usermod -aG audio node
 
-# إنشاء بيئة تشغيل لـ PulseAudio لتجنب أخطاء الصلاحيات
+# إعداد مجلد runtime لـ PulseAudio
 ENV XDG_RUNTIME_DIR=/tmp/runtime-node
 RUN mkdir -p /tmp/runtime-node && chown -R node:node /tmp/runtime-node && chmod 700 /tmp/runtime-node
 
-# إعداد مسار العمل
 WORKDIR /app
 
-# نسخ ملفات الـ package وتثبيت الحزم
 COPY package*.json ./
 RUN npm install
 
-# 🔴 الحل الجذري لمشكلة المتصفح 🔴
-# إجبار Playwright على تثبيت المتصفح في مسار عام ليتمكن المستخدم node من قراءته
+# تثبيت Playwright وتعيين مساره في مكان عام
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx playwright install chromium
 RUN npx playwright install-deps chromium
 RUN chmod -R 777 /ms-playwright
 
-# نسخ باقي ملفات المشروع
 COPY . .
 
-# منح صلاحيات التنفيذ لسكريبت الدخول وتعديل ملكية الملفات
 RUN chmod +x entrypoint.sh && chown -R node:node /app
 
-# التحويل إلى المستخدم غير الجذري
 USER node
 
-# بدء سكريبت التشغيل
 ENTRYPOINT ["./entrypoint.sh"]
