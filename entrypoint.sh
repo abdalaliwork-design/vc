@@ -14,23 +14,31 @@ pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false
 sleep 2
 
 echo "Creating Virtual Audio Sink (DiscordSink) — Grok audio plays here..."
-pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink"
+pactl load-module module-null-sink \
+    sink_name=DiscordSink \
+    sink_properties=device.description="DiscordSink" \
+    rate=48000 channels=2 format=s16le
 
 echo "Creating Virtual Mic Sink (DiscordMic) — bot writes user audio here..."
-pactl load-module module-null-sink sink_name=DiscordMic sink_properties=device.description="DiscordMic"
+pactl load-module module-null-sink \
+    sink_name=DiscordMic \
+    sink_properties=device.description="DiscordMic" \
+    rate=48000 channels=2 format=s16le
 
-# ✅ KEY FIX: Expose DiscordMic.monitor as a real microphone source (VirtualMic)
-# Without this, Chrome can't see a real input device and denies mic access.
-# module-virtual-source creates a proper source that Chrome/WebRTC can enumerate and use.
 echo "Creating VirtualMic source from DiscordMic.monitor..."
 pactl load-module module-virtual-source \
     source_name=VirtualMic \
     master=DiscordMic.monitor \
-    source_properties=device.description="VirtualMic"
+    source_properties=device.description="VirtualMic" \
+    rate=48000 channels=2
 
 echo "Setting PulseAudio defaults..."
 pactl set-default-sink DiscordSink
-pactl set-default-source VirtualMic   # ✅ Chrome will use this as the microphone
+pactl set-default-source VirtualMic
+
+# ✅ Force ALL child processes (Node.js, Chrome) to use our virtual devices
+export PULSE_SINK=DiscordSink
+export PULSE_SOURCE=VirtualMic
 
 echo "PulseAudio sources and sinks:"
 pactl list short sources
