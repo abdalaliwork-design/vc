@@ -37,7 +37,7 @@ RUN mkdir -p /tmp/runtime-node && chown -R node:node /tmp/runtime-node && chmod 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npx playwright install chromium
@@ -55,4 +55,3 @@ EXPOSE 5900
 USER node
 
 ENTRYPOINT ["./entrypoint.sh"]
-
