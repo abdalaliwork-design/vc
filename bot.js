@@ -12,6 +12,7 @@ const {
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
 const fs = require('fs');
 const prism = require('prism-media');
 
@@ -27,26 +28,31 @@ const client = new Client({
 });
 
 // ─── متغيرات الجلسة ────────────────────────────────────────────────────────
-let browser       = null;
-let page          = null;
-let ffmpegOut     = null;  // Grok → Discord
-let ffmpegIn      = null;  // Discord → Grok
-let connection    = null;
-let player        = null;
-let isTtsBusy     = false;
-let sessionUserId = null;
+let browser        = null;
+let page           = null;
+let ffmpegOut      = null;
+let ffmpegIn       = null;
+let connection     = null;
+let player         = null;
+let grokPassthrough= null;   // ✅ Stream دائم لا يُغلق أبداً
+let sessionUserId  = null;
 
 const commands = [
     { name: 'start', description: 'يبدأ جلسة Grok ويربط الصوت 🎙️' },
     { name: 'stop',  description: 'يوقف الجلسة ويحرر الموارد 🛑'  }
 ];
 
-// ─── دالة: بث صوت Grok → Discord ──────────────────────────────────────────
+// ─── دالة: بدء بث صوت Grok → Discord ─────────────────────────────────────
+// ✅ الحل الجذري: FFmpeg يُضخّ في PassThrough دائم
+// الـ Player يقرأ من PassThrough فلا يتوقف أبداً → لا Broken pipe
 function startGrokAudio() {
-    if (isTtsBusy) return;
-    if (ffmpegOut) { ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
+    if (ffmpegOut) {
+        ffmpegOut.stdout.unpipe();
+        ffmpegOut.kill('SIGKILL');
+        ffmpegOut = null;
+    }
 
-    console.log('🔊 تشغيل FFmpeg: DiscordSink.monitor → Discord');
+    console.log('🔊 تشغيل FFmpeg: DiscordSink.monitor → PassThrough → Discord');
 
     ffmpegOut = spawn('ffmpeg', [
         '-loglevel', 'warning',
@@ -61,23 +67,105 @@ function startGrokAudio() {
         'pipe:1'
     ]);
 
-    ffmpegOut.stderr.on('data', d => console.error('[FFmpeg-OUT]', d.toString().trim()));
-    ffmpegOut.on('error', err => {
-        console.error('❌ FFmpeg-OUT error:', err.message);
-        setTimeout(() => { if (connection && !isTtsBusy) startGrokAudio(); }, 2000);
-    });
-    ffmpegOut.on('exit', (code, sig) => {
-        console.warn(`⚠️ FFmpeg-OUT exited code=${code} sig=${sig}`);
-        if (connection && !isTtsBusy) setTimeout(() => startGrokAudio(), 1000);
+    // ✅ يضخّ في PassThrough بدون إغلاقه عند انتهاء FFmpeg
+    ffmpegOut.stdout.pipe(grokPassthrough, { end: false });
+
+    ffmpegOut.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (msg && !msg.includes('Guessed Channel')) {
+            console.error('[FFmpeg-OUT]', msg);
+        }
     });
 
-    const resource = createAudioResource(ffmpegOut.stdout, {
-        inputType: StreamType.Raw,
-        silencePaddingFrames: 5
+    ffmpegOut.on('error', err => {
+        console.error('❌ FFmpeg-OUT error:', err.message);
+        setTimeout(() => { if (connection) startGrokAudio(); }, 2000);
+    });
+
+    ffmpegOut.on('exit', (code, sig) => {
+        if (sig !== 'SIGKILL') {
+            console.warn(`⚠️ FFmpeg-OUT exited code=${code}, restarting...`);
+            setTimeout(() => { if (connection) startGrokAudio(); }, 1000);
+        }
+    });
+}
+
+// ─── دالة: إعداد Player مرة واحدة فقط ────────────────────────────────────
+function initPlayer() {
+    grokPassthrough = new PassThrough();
+
+    // كتابة صمت مبدئي (2 ثانية) لتجنب idle فوري
+    const silence = Buffer.alloc(48000 * 2 * 2 * 2); // 2s @ 48kHz stereo 16-bit
+    grokPassthrough.write(silence);
+
+    player = createAudioPlayer({
+        behaviors: { noSubscriber: NoSubscriberBehavior.Play }
+    });
+
+    // ✅ PassThrough لا يُرسل EOF أبداً فالـ player يبقى Playing
+    const resource = createAudioResource(grokPassthrough, {
+        inputType: StreamType.Raw
     });
 
     player.play(resource);
-    connection.subscribe(player);
+
+    player.on('error', err => {
+        console.error('❌ Player error:', err.message);
+    });
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        // لا يجب أن يحدث مع PassThrough، لكن كإجراء احترازي
+        console.warn('⚠️ Player went Idle — reattaching resource');
+        if (grokPassthrough && connection) {
+            const newResource = createAudioResource(grokPassthrough, {
+                inputType: StreamType.Raw
+            });
+            player.play(newResource);
+        }
+    });
+}
+
+// ─── دالة: TTS يكتب مباشرة لـ PulseAudio DiscordSink ─────────────────────
+// ✅ لا يحتاج تبديل player أبداً — صوت espeak يدخل المنظومة كأنه صوت Grok
+function speakText(text) {
+    return new Promise((resolve) => {
+        const isArabic = /[\u0600-\u06FF]/.test(text);
+        const lang = isArabic ? 'ar' : 'en';
+
+        console.log(`💬 TTS [${lang}]: ${text.substring(0, 60)}`);
+
+        const espeak = spawn('espeak', ['-v', lang, '-s', '150', '--stdout', text]);
+        const ffmpeg = spawn('ffmpeg', [
+            '-loglevel', 'warning',
+            '-f', 'wav',
+            '-i', 'pipe:0',
+            '-ar', '48000',
+            '-ac', '2',
+            '-f', 'pulse',
+            'DiscordSink'        // ✅ يكتب مباشرة لـ DiscordSink
+        ]);
+
+        espeak.stdout.pipe(ffmpeg.stdin);
+
+        espeak.stderr.on('data', () => {});
+        ffmpeg.stderr.on('data', d => {
+            const msg = d.toString().trim();
+            if (msg && !msg.includes('Guessed')) console.error('[TTS]', msg);
+        });
+
+        espeak.on('error', err => {
+            console.error('❌ espeak error:', err.message);
+            resolve();
+        });
+        ffmpeg.on('error', err => {
+            console.error('❌ TTS-ffmpeg error:', err.message);
+            resolve();
+        });
+        ffmpeg.on('exit', () => {
+            console.log('✅ TTS انتهى');
+            resolve();
+        });
+    });
 }
 
 // ─── دالة: استقبال صوت المستخدم → Grok (مستمر) ────────────────────────────
@@ -103,7 +191,10 @@ function setupVoiceInput(receiver) {
             '-f', 'pulse', 'DiscordMic'
         ]);
 
-        ffmpegIn.stderr.on('data', d => console.error('[FFmpeg-IN]', d.toString().trim()));
+        ffmpegIn.stderr.on('data', d => {
+            const msg = d.toString().trim();
+            if (msg && !msg.includes('Guessed')) console.error('[FFmpeg-IN]', msg);
+        });
         ffmpegIn.on('error', err => console.error('❌ FFmpeg-IN error:', err.message));
 
         audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin);
@@ -115,68 +206,7 @@ function setupVoiceInput(receiver) {
     });
 }
 
-// ─── دالة: TTS (نص → صوت في Discord) ─────────────────────────────────────
-function speakText(text) {
-    if (!player || !connection) return Promise.resolve();
-    isTtsBusy = true;
-
-    // إيقاف بث Grok مؤقتاً
-    if (ffmpegOut) { ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
-
-    return new Promise((resolve) => {
-        const isArabic = /[\u0600-\u06FF]/.test(text);
-        const lang = isArabic ? 'ar' : 'en';
-
-        console.log(`💬 TTS [${lang}]: ${text.substring(0, 60)}`);
-
-        const espeak = spawn('espeak', ['-v', lang, '-s', '150', '--stdout', text]);
-        const ffmpeg = spawn('ffmpeg', [
-            '-loglevel', 'warning',
-            '-f', 'wav', '-i', 'pipe:0',
-            '-ar', '48000', '-ac', '2',
-            '-f', 's16le', 'pipe:1'
-        ]);
-
-        espeak.stdout.pipe(ffmpeg.stdin);
-        espeak.stderr.on('data', () => {});
-        ffmpeg.stderr.on('data', d => console.error('[TTS-ffmpeg]', d.toString().trim()));
-
-        espeak.on('error', err => {
-            console.error('❌ espeak error:', err.message);
-            isTtsBusy = false;
-            if (connection) startGrokAudio();
-            resolve();
-        });
-
-        const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
-        player.play(resource);
-        connection.subscribe(player);
-
-        const onIdle = () => {
-            console.log('✅ TTS انتهى → استئناف Grok');
-            isTtsBusy = false;
-            if (connection) startGrokAudio();
-            resolve();
-        };
-
-        player.once(AudioPlayerStatus.Idle, onIdle);
-
-        // ضمان: إذا فشل الـ player لأي سبب، نستأنف على أي حال
-        ffmpeg.on('exit', () => {
-            setTimeout(() => {
-                if (isTtsBusy) {
-                    isTtsBusy = false;
-                    player.removeListener(AudioPlayerStatus.Idle, onIdle);
-                    if (connection) startGrokAudio();
-                    resolve();
-                }
-            }, 500);
-        });
-    });
-}
-
 // ─── حدث: جاهزية البوت ─────────────────────────────────────────────────────
-// ✅ تم الإصلاح: clientReady (متوافق مع discord.js v14)
 client.on('clientReady', async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
     try {
@@ -189,8 +219,9 @@ client.on('clientReady', async () => {
 
 // ─── حدث: رسائل النص → TTS ────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
-    if (message.author.bot)      return;
-    if (!connection || !player)  return;
+    if (message.author.bot)     return;
+    if (!connection || !player) return;
+
     const text = message.content.trim();
     if (!text || text.startsWith('/')) return;
 
@@ -219,7 +250,10 @@ client.on('interactionCreate', async (interaction) => {
         sessionUserId = interaction.user.id;
 
         try {
-            // 1. الانضمام للقناة الصوتية
+            // 1. إعداد Player مع PassThrough
+            initPlayer();
+
+            // 2. الانضمام للقناة الصوتية
             connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: interaction.guild.id,
@@ -228,15 +262,7 @@ client.on('interactionCreate', async (interaction) => {
                 selfMute: false
             });
 
-            // 2. مشغّل الصوت
-            player = createAudioPlayer({
-                behaviors: { noSubscriber: NoSubscriberBehavior.Play }
-            });
-
-            player.on('error', err => {
-                console.error('❌ Player error:', err.message);
-                if (!isTtsBusy && connection) setTimeout(() => startGrokAudio(), 1500);
-            });
+            connection.subscribe(player);
 
             // 3. تشغيل المتصفح
             browser = await chromium.launch({
@@ -253,7 +279,7 @@ client.on('interactionCreate', async (interaction) => {
 
             const context = await browser.newContext({ permissions: ['microphone'] });
 
-            // 4. تحويل الكوكيز وتحميلها
+            // 4. تحويل وتحميل الكوكيز
             const convertCookies = (raw) => raw.map(c => ({
                 name:     c.name,
                 value:    c.value,
@@ -275,7 +301,7 @@ client.on('interactionCreate', async (interaction) => {
                     await context.addCookies(convertCookies(JSON.parse(process.env.GROK_COOKIES)));
                     console.log('✅ الكوكيز محملة من Railway.');
                 } catch (e) {
-                    console.error('❌ خطأ في GROK_COOKIES:', e.message);
+                    console.error('❌ GROK_COOKIES error:', e.message);
                     interaction.channel.send('⚠️ خطأ في قراءة GROK_COOKIES!');
                 }
             } else if (fs.existsSync('./cookies.json')) {
@@ -294,7 +320,9 @@ client.on('interactionCreate', async (interaction) => {
             connection.on(VoiceConnectionStatus.Ready, () => {
                 console.log('✅ الاتصال الصوتي جاهز!');
                 setupVoiceInput(connection.receiver);
-                setTimeout(() => startGrokAudio(), 2000); // تأخير لتجنب race condition
+
+                // ✅ بدء FFmpeg بعد ثانيتين لضمان استقرار PulseAudio
+                setTimeout(() => startGrokAudio(), 2000);
             });
 
             connection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -302,41 +330,41 @@ client.on('interactionCreate', async (interaction) => {
             });
 
             await interaction.editReply(
-                '✅ **الجلسة تعمل الآن!**\n' +
+                '✅ **الجلسة تعمل!**\n' +
                 '🔊 صوت Grok → Discord\n' +
                 '🎤 صوتك → Grok\n' +
-                '💬 **اكتب أي نص هنا** وسيُقرأ بصوت عالٍ في القناة'
+                '💬 اكتب أي نص ليُقرأ بصوت في القناة'
             );
 
         } catch (error) {
             console.error('❌ فشل التشغيل:', error);
             await interaction.editReply('❌ فشل: ' + error.message);
-
-            if (ffmpegOut)  { ffmpegOut.kill('SIGKILL');  ffmpegOut = null; }
-            if (ffmpegIn)   { ffmpegIn.kill('SIGKILL');   ffmpegIn = null;  }
-            if (browser)    { await browser.close().catch(() => {}); browser = null; page = null; }
-            if (connection) { connection.destroy(); connection = null; }
-            if (player)     { player.stop(); player = null; }
-            isTtsBusy = false;
+            cleanupAll();
         }
     }
 
     // ━━━ /stop ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (interaction.commandName === 'stop') {
         if (!browser) return interaction.reply({ content: '⚠️ لا توجد جلسة نشطة.', ephemeral: true });
-
         await interaction.reply('🛑 جاري الإيقاف...');
-
-        if (ffmpegOut)  { ffmpegOut.kill('SIGKILL');  ffmpegOut = null;  }
-        if (ffmpegIn)   { ffmpegIn.kill('SIGKILL');   ffmpegIn = null;   }
-        if (browser)    { await browser.close().catch(() => {}); browser = null; page = null; }
-        if (connection) { connection.destroy(); connection = null; }
-        if (player)     { player.stop(); player = null; }
-        isTtsBusy     = false;
-        sessionUserId = null;
-
+        cleanupAll();
         await interaction.editReply('✅ تم إيقاف كل شيء بنجاح.');
     }
 });
+
+// ─── دالة التنظيف الشامل ───────────────────────────────────────────────────
+function cleanupAll() {
+    if (ffmpegOut) {
+        ffmpegOut.stdout.unpipe();
+        ffmpegOut.kill('SIGKILL');
+        ffmpegOut = null;
+    }
+    if (ffmpegIn)       { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+    if (grokPassthrough){ grokPassthrough.destroy(); grokPassthrough = null; }
+    if (browser)        { browser.close().catch(() => {}); browser = null; page = null; }
+    if (connection)     { connection.destroy(); connection = null; }
+    if (player)         { player.stop(); player = null; }
+    sessionUserId = null;
+}
 
 client.login(process.env.DISCORD_TOKEN);
