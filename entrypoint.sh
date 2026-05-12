@@ -1,5 +1,4 @@
 #!/bin/bash
-
 echo "Cleaning up old locks..."
 rm -f /tmp/.X99-lock
 rm -rf /tmp/runtime-node/*
@@ -14,19 +13,32 @@ echo "Starting PulseAudio..."
 pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false
 sleep 2
 
-echo "Creating Virtual Audio Sink (DiscordSink)..."
+echo "Creating Virtual Audio Sink (DiscordSink) — Grok audio plays here..."
 pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink"
 
-echo "Creating Virtual Audio Source (DiscordMic)..."
+echo "Creating Virtual Mic Sink (DiscordMic) — bot writes user audio here..."
 pactl load-module module-null-sink sink_name=DiscordMic sink_properties=device.description="DiscordMic"
 
+# ✅ KEY FIX: Expose DiscordMic.monitor as a real microphone source (VirtualMic)
+# Without this, Chrome can't see a real input device and denies mic access.
+# module-virtual-source creates a proper source that Chrome/WebRTC can enumerate and use.
+echo "Creating VirtualMic source from DiscordMic.monitor..."
+pactl load-module module-virtual-source \
+    source_name=VirtualMic \
+    master=DiscordMic.monitor \
+    source_properties=device.description="VirtualMic"
+
+echo "Setting PulseAudio defaults..."
 pactl set-default-sink DiscordSink
-pactl set-default-source DiscordMic.monitor
+pactl set-default-source VirtualMic   # ✅ Chrome will use this as the microphone
+
+echo "PulseAudio sources and sinks:"
+pactl list short sources
+pactl list short sinks
 
 # ─── noVNC Setup ─────────────────────────────────────────────────────────────
 NOVNC_PORT=${NOVNC_PORT:-6080}
 VNC_PORT=5900
-VNC_PASS=${VNC_PASSWORD:-"botpass123"}
 
 echo "Starting x11vnc on port $VNC_PORT..."
 x11vnc -display :99 \
@@ -37,7 +49,6 @@ x11vnc -display :99 \
     -noxdamage \
     -quiet \
     -bg 2>/dev/null
-
 sleep 1
 
 echo "Starting noVNC on port $NOVNC_PORT..."
@@ -45,7 +56,6 @@ if [ -d "/opt/novnc" ]; then
     websockify --web /opt/novnc/utils/novnc_proxy --wrap-mode=ignore $NOVNC_PORT localhost:$VNC_PORT &
     echo "✅ noVNC ready → http://localhost:$NOVNC_PORT/vnc.html"
 elif command -v websockify &>/dev/null; then
-    # Try to find noVNC share dir
     NOVNC_SHARE=$(find /usr -name "vnc.html" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
     if [ -n "$NOVNC_SHARE" ]; then
         websockify --web "$NOVNC_SHARE" $NOVNC_PORT localhost:$VNC_PORT &
@@ -56,13 +66,14 @@ elif command -v websockify &>/dev/null; then
     fi
 else
     echo "⚠️  noVNC/websockify not installed — VNC only on port $VNC_PORT"
-    echo "    Install with: apt-get install novnc websockify x11vnc"
 fi
 
 echo ""
 echo "═══════════════════════════════════════════"
 echo "  🖥️  noVNC:  http://YOUR_HOST:$NOVNC_PORT/vnc.html"
 echo "  🖥️  VNC:    vnc://YOUR_HOST:$VNC_PORT"
+echo "  🎤  VirtualMic source: DiscordMic.monitor → VirtualMic"
+echo "  🔊  Grok audio sink:   DiscordSink"
 echo "  🎤  Listening ONLY to user: 712321588342816879"
 echo "═══════════════════════════════════════════"
 echo ""
