@@ -491,11 +491,15 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
-                    // ❌ REMOVED: '--use-fake-ui-for-media-stream' — this hijacks PulseAudio with a silent fake mic
-                    '--use-fake-device-for-media-stream', // keeps Chrome happy without blocking real audio
+                    // ✅ REMOVED --use-fake-device-for-media-stream — that flag makes Chrome
+                    //    use a silent fake mic instead of VirtualMic (PulseAudio). Without it,
+                    //    Chrome uses the real PulseAudio default source (VirtualMic).
                     '--allow-file-access-from-files',
                     '--disable-web-security',
                     '--disable-features=WebRtcHideLocalIpsWithMdns',
+                    // ✅ Tell Chrome explicitly to use PulseAudio
+                    '--alsa-output-device=pulse',
+                    '--disable-audio-output',
                 ]
             });
 
