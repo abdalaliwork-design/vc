@@ -341,11 +341,29 @@ client.on('interactionCreate', async (interaction) => {
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
             console.log('✅ Grok محمّل.');
 
-            connection.on(VoiceConnectionStatus.Ready, () => {
+            let voiceInputReady = false;
+            const onReady = () => {
+                if (voiceInputReady) return;
+                voiceInputReady = true;
                 console.log('✅ الاتصال الصوتي جاهز!');
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
-            });
+            };
+
+            connection.on(VoiceConnectionStatus.Ready, onReady);
+
+            // If already Ready before listener was attached, fire immediately
+            if (connection.state.status === VoiceConnectionStatus.Ready) {
+                onReady();
+            } else {
+                // Fallback: force-init after 5 s regardless
+                setTimeout(() => {
+                    if (!voiceInputReady && connection) {
+                        console.warn('⚠️ Ready لم يصل — تهيئة إجبارية');
+                        onReady();
+                    }
+                }, 5000);
+            }
 
             connection.on(VoiceConnectionStatus.Disconnected, () => {
                 console.warn('⚠️ انقطع الاتصال الصوتي');
