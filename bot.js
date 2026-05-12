@@ -1,7 +1,7 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
 const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-stealth')();
+const stealth = require('puppeteer-extra-plugin-stealth')(); // تم تصحيح اسم الحزمة هنا
 const { spawn } = require('child_process');
 const fs = require('fs');
 
@@ -88,7 +88,7 @@ client.on('messageCreate', async (message) => {
 
             // ضمان فتح Tab واحد فقط لتوفير استهلاك الرام (< 1GB)
             page = await context.newPage();
-            // تم التعديل إلى رابط grok.com المباشر بناءً على الكوكيز الخاصة بك
+            // الدخول إلى الرابط المباشر لـ Grok
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
 
             // 4. تشغيل FFmpeg لسحب الصوت من الـ Monitor الخاص بـ DiscordSink
@@ -117,7 +117,7 @@ client.on('messageCreate', async (message) => {
             player.play(resource);
             connection.subscribe(player);
 
-            msg.edit('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل (على grok.com) والصوت يتم بثه الآن إلى القناة.');
+            msg.edit('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل والصوت يتم بثه الآن إلى القناة.');
 
         } catch (error) {
             console.error(error);
