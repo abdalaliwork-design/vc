@@ -17,11 +17,18 @@ pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false
 sleep 2 # الانتظار لتهيئة الصوت
 
 echo "Creating Virtual Audio Sink (DiscordSink)..."
-# إنشاء مخرج صوت وهمي
+# إنشاء مخرج صوت وهمي (لإرسال صوت Grok إلى Discord)
 pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink"
 
-# جعل هذا المخرج هو الافتراضي للنظام (ليذهب صوت المتصفح إليه مباشرة)
+echo "Creating Virtual Audio Source (DiscordMic)..."
+# إنشاء مدخل صوت وهمي (لاستقبال صوتك من Discord وإرساله إلى Grok)
+pactl load-module module-null-sink sink_name=DiscordMic sink_properties=device.description="DiscordMic"
+
+# جعل DiscordSink هو المخرج الافتراضي (لصوت Grok)
 pactl set-default-sink DiscordSink
+
+# جعل DiscordMic.monitor هو المدخل الافتراضي (لصوتك)
+pactl set-default-source DiscordMic.monitor
 
 echo "Starting Node.js Bot..."
 node bot.js
