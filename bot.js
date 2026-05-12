@@ -181,7 +181,7 @@ function speakText(text) {
 
             // Step 2: ffmpeg reads the complete file — no header issues
             const ffmpeg = spawn('ffmpeg', [
-                '-loglevel', 'warning',
+                '-loglevel', 'error',
                 '-i', tmpFile,
                 '-ar', '48000',
                 '-ac', '2',
