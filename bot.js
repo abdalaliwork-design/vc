@@ -9,7 +9,9 @@ const {
     EndBehaviorType,
     AudioPlayerStatus
 } = require('@discordjs/voice');
-const { chromium } = require('playwright-extra');
+const { addExtra } = require('playwright-extra');
+const { chromium: playwrightChromium } = require('playwright');
+const chromium = addExtra(playwrightChromium);
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
