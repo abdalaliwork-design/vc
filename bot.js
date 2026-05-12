@@ -33,6 +33,7 @@ const client = new Client({
 
 let browser         = null;
 let page            = null;
+let cdpSession      = null;   // ✅ CDP session for deep permission control
 let ffmpegOut       = null;
 let ffmpegIn        = null;
 let connection      = null;
@@ -84,7 +85,11 @@ async function sendTextToGrok(text) {
                 if (inputEl) { console.log(`✅ وجد المربع: ${sel}`); break; }
             } catch { /* try next */ }
         }
-        if (!inputEl) { console.error('❌ لم يتم العثور على مربع الإدخال'); isSendingToGrok = false; return; }
+        if (!inputEl) {
+            console.error('❌ لم يتم العثور على مربع الإدخال');
+            isSendingToGrok = false;
+            return;
+        }
         await inputEl.click();
         await page.keyboard.type(text, { delay: 30 });
         await page.keyboard.press('Enter');
@@ -96,7 +101,7 @@ async function sendTextToGrok(text) {
     }
 }
 
-// ─── Capture Grok audio output → Discord ─────────────────────────────────────
+// ─── Capture Grok audio → Discord ────────────────────────────────────────────
 function startGrokAudio() {
     if (ffmpegOut) { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     console.log('🔊 FFmpeg: DiscordSink.monitor → Discord');
@@ -114,8 +119,16 @@ function startGrokAudio() {
         const msg = d.toString().trim();
         if (msg && !msg.includes('Guessed Channel')) console.error('[FFmpeg-OUT]', msg);
     });
-    ffmpegOut.on('error', err => { console.error('❌ FFmpeg-OUT:', err.message); setTimeout(() => { if (connection) startGrokAudio(); }, 2000); });
-    ffmpegOut.on('exit', (code, sig) => { if (sig !== 'SIGKILL') { console.warn(`⚠️ FFmpeg-OUT exit ${code}, restarting`); setTimeout(() => { if (connection) startGrokAudio(); }, 1000); } });
+    ffmpegOut.on('error', err => {
+        console.error('❌ FFmpeg-OUT:', err.message);
+        setTimeout(() => { if (connection) startGrokAudio(); }, 2000);
+    });
+    ffmpegOut.on('exit', (code, sig) => {
+        if (sig !== 'SIGKILL') {
+            console.warn(`⚠️ FFmpeg-OUT exit ${code}, restarting`);
+            setTimeout(() => { if (connection) startGrokAudio(); }, 1000);
+        }
+    });
 }
 
 function initPlayer() {
@@ -129,14 +142,15 @@ function initPlayer() {
     player.on(AudioPlayerStatus.Idle, () => {
         if (isIdleBusy || !grokPassthrough || !connection) return;
         isIdleBusy = true;
-        try { player.play(createAudioResource(grokPassthrough, { inputType: StreamType.Raw })); } catch (e) { console.error('❌ reattach:', e.message); }
+        try { player.play(createAudioResource(grokPassthrough, { inputType: StreamType.Raw })); }
+        catch (e) { console.error('❌ reattach:', e.message); }
         setImmediate(() => { isIdleBusy = false; });
     });
 }
 
-// ─── User voice → DiscordMic → Grok browser mic ──────────────────────────────
+// ─── User voice → DiscordMic → Grok browser ──────────────────────────────────
 function setupVoiceInput(receiver) {
-    console.log(`🎧 استقبال صوت المستخدم: ${ALLOWED_USER_ID}`);
+    console.log(`🎧 استقبال صوت: ${ALLOWED_USER_ID}`);
     function listenToUser() {
         if (!connection || !sessionUserId) return;
         const audioStream = receiver.subscribe(ALLOWED_USER_ID, {
@@ -160,7 +174,10 @@ function setupVoiceInput(receiver) {
             '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
             '-f', 'pulse', 'DiscordMic'
         ]);
-        ffmpegIn.stderr.on('data', d => { const m = d.toString().trim(); if (m && !m.includes('Guessed')) console.error('[FFmpeg-IN]', m); });
+        ffmpegIn.stderr.on('data', d => {
+            const m = d.toString().trim();
+            if (m && !m.includes('Guessed')) console.error('[FFmpeg-IN]', m);
+        });
         ffmpegIn.on('error', err => console.error('❌ FFmpeg-IN:', err.message));
         audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin);
         audioStream.on('end', () => {
@@ -172,57 +189,126 @@ function setupVoiceInput(receiver) {
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
             setTimeout(() => listenToUser(), 100);
         });
-        audioStream.on('error', () => { if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; } setTimeout(() => listenToUser(), 500); });
+        audioStream.on('error', () => {
+            if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+            setTimeout(() => listenToUser(), 500);
+        });
     }
     listenToUser();
 }
 
-// ─── Grant mic to Grok and click voice button ────────────────────────────────
+// ─── GRANT MIC VIA CDP + CLICK VOICE BUTTON ──────────────────────────────────
 async function activateGrokVoiceMode() {
     if (!page) return;
     console.log('🎙️ تفعيل وضع الصوت في Grok...');
-    try {
-        // Grant microphone permission
-        await page.context().grantPermissions(['microphone'], { origin: 'https://grok.com' });
-        console.log('✅ تم منح صلاحية الميكروفون لـ Grok');
 
-        // Dismiss Connectors popup
+    try {
+        // ✅ Step 1: Use CDP to grant microphone at the browser level
+        // This bypasses Chrome's permission UI entirely
+        cdpSession = await page.context().newCDPSession(page);
+
+        await cdpSession.send('Browser.grantPermissions', {
+            permissions: ['audioCapture', 'videoCapture'],
+            origin: 'https://grok.com'
+        });
+        console.log('✅ CDP: تم منح صلاحية الميكروفون عبر Browser.grantPermissions');
+
+        // ✅ Step 2: Intercept getUserMedia at JS level so it ALWAYS succeeds
+        await page.addInitScript(() => {
+            // Override permission query to always return 'granted'
+            const origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (parameters) => {
+                if (parameters.name === 'microphone' || parameters.name === 'camera') {
+                    return Promise.resolve({ state: 'granted', onchange: null });
+                }
+                return origQuery(parameters);
+            };
+        });
+
+        // ✅ Step 3: Dismiss Connectors popup
         try {
             await page.click('text=Dismiss', { timeout: 2000 });
-            console.log('✅ تم إغلاق نافذة Connectors');
+            console.log('✅ أُغلقت نافذة Connectors');
         } catch { /* no popup */ }
 
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(800);
 
-        // Try to click the waveform/voice button (last icon in Grok input bar)
-        const clicked = await page.evaluate(() => {
-            // Look for buttons near the chat input
-            const buttons = Array.from(document.querySelectorAll('button'));
-            // The voice button usually has an SVG with wavy lines (waveform) or mic icon
-            const voiceBtn = buttons.find(b => {
-                const svg = b.querySelector('svg');
-                if (!svg) return false;
-                const label = (b.getAttribute('aria-label') || b.title || '').toLowerCase();
-                return label.includes('voice') || label.includes('mic') || label.includes('audio') || label.includes('speak');
-            });
-            if (voiceBtn) { voiceBtn.click(); return true; }
+        // ✅ Step 4: Click the voice/waveform button
+        // From the screenshot: it's the filled dark circle button (rightmost in input bar)
+        const voiceClicked = await page.evaluate(() => {
+            const allButtons = Array.from(document.querySelectorAll('button'));
 
-            // Fallback: last button in input area
-            const inputArea = document.querySelector('form, [role="search"], .relative.flex');
-            if (inputArea) {
-                const btns = inputArea.querySelectorAll('button');
-                if (btns.length > 0) { btns[btns.length - 1].click(); return 'last'; }
+            // Strategy 1: aria-label containing voice/mic/audio
+            for (const btn of allButtons) {
+                const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || '').toLowerCase();
+                if (label.includes('voice') || label.includes('mic') || label.includes('audio') || label.includes('speak')) {
+                    btn.click();
+                    return `aria-label: ${label}`;
+                }
             }
+
+            // Strategy 2: The dark filled circle button (last button in Grok's input form)
+            // In Grok's UI this is the waveform button — black rounded button on the right
+            const form = document.querySelector('form');
+            if (form) {
+                const btns = Array.from(form.querySelectorAll('button'));
+                // Find button with dark/filled background (the voice one)
+                for (const btn of btns) {
+                    const style = window.getComputedStyle(btn);
+                    const bg = style.backgroundColor;
+                    // Dark background = voice button
+                    if (bg && (bg.includes('0, 0, 0') || bg.includes('rgb(0') || btn.classList.toString().includes('bg-'))) {
+                        btn.click();
+                        return `dark-bg-button: ${btn.className.substring(0, 50)}`;
+                    }
+                }
+                // Fallback: last button in form
+                if (btns.length > 0) {
+                    btns[btns.length - 1].click();
+                    return `last-form-button (${btns.length} buttons found)`;
+                }
+            }
+
+            // Strategy 3: Any button containing an SVG that looks like waveform/mic
+            for (const btn of allButtons) {
+                const svgPaths = btn.querySelectorAll('svg path');
+                if (svgPaths.length >= 3) { // waveform has multiple paths
+                    // Check if it's in the input area
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.bottom > window.innerHeight * 0.6) { // bottom half of screen
+                        btn.click();
+                        return `svg-waveform at y=${rect.bottom}`;
+                    }
+                }
+            }
+
             return false;
         });
 
-        console.log(`🎙️ نتيجة النقر على زر الصوت: ${clicked}`);
+        console.log(`🎙️ نتيجة النقر على زر الصوت: ${voiceClicked}`);
+
+        // ✅ Step 5: Handle the mic permission dialog that Chrome might show
+        page.on('dialog', async dialog => {
+            console.log(`📢 Dialog: ${dialog.type()} — ${dialog.message()}`);
+            await dialog.dismiss();
+        });
+
+        // Watch for permission prompt via CDP and auto-accept
+        try {
+            cdpSession.on('Page.javascriptDialogOpening', async () => {
+                await cdpSession.send('Page.handleJavaScriptDialog', { accept: true });
+            });
+        } catch { /* ignore */ }
+
+        await page.waitForTimeout(1000);
+        console.log('✅ activateGrokVoiceMode مكتمل');
 
     } catch (err) {
         console.error('❌ activateGrokVoiceMode:', err.message);
     }
 }
 
+// ─── Bot ready ────────────────────────────────────────────────────────────────
 client.on('clientReady', async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
     console.log(`🔒 يقبل فقط من: ${ALLOWED_USER_ID}`);
@@ -232,7 +318,7 @@ client.on('clientReady', async () => {
     } catch (err) { console.error('❌ خطأ في تسجيل الأوامر:', err); }
 });
 
-// ─── Text message → send to Grok (NOT espeak) ────────────────────────────────
+// ─── Text → Grok (not espeak) ─────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (message.author.id !== ALLOWED_USER_ID) {
@@ -254,13 +340,15 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+// ─── Slash commands ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.user.id !== ALLOWED_USER_ID) {
-        console.log(`⛔ [CMD BLOCKED] ${interaction.user.tag} → /${interaction.commandName}`);
+        console.log(`⛔ [BLOCKED] ${interaction.user.tag} → /${interaction.commandName}`);
         return interaction.reply({ content: '❌ ليس لديك صلاحية.', ephemeral: true });
     }
 
+    // ━━━ /start ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (interaction.commandName === 'start') {
         const voiceChannel = interaction.member?.voice.channel;
         if (!voiceChannel) return interaction.reply({ content: '❌ انضم لقناة صوتية أولاً!', ephemeral: true });
@@ -283,6 +371,8 @@ client.on('interactionCreate', async (interaction) => {
             });
             connection.subscribe(player);
 
+            // ✅ Launch with fake-ui (suppresses Chrome's permission popup)
+            // but WITHOUT fake-device (so PulseAudio mic works for real)
             browser = await chromium.launch({
                 headless: false,
                 args: [
@@ -290,16 +380,16 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
-                    '--use-fake-ui-for-media-stream',
-                    // DO NOT add --use-fake-device-for-media-stream (kills PulseAudio)
+                    '--use-fake-ui-for-media-stream',   // auto-accept mic dialog
+                    '--allow-file-access-from-files',
+                    '--disable-web-security',
                 ]
             });
 
-            // ✅ Grant mic permission at context level — fixes "Microphone access denied"
+            // ✅ Context with mic pre-granted
             const context = await browser.newContext({
-                permissions: ['microphone'],
+                permissions: ['microphone', 'camera'],
             });
-            await context.grantPermissions(['microphone'], { origin: 'https://grok.com' });
 
             const convertCookies = (raw) => raw.map(c => ({
                 name: c.name, value: c.value, domain: c.domain,
@@ -315,21 +405,53 @@ client.on('interactionCreate', async (interaction) => {
             }));
 
             if (process.env.GROK_COOKIES) {
-                try { await context.addCookies(convertCookies(JSON.parse(process.env.GROK_COOKIES))); console.log('✅ الكوكيز محملة من Railway.'); }
-                catch (e) { console.error('❌ GROK_COOKIES:', e.message); interaction.channel.send('⚠️ خطأ في GROK_COOKIES!'); }
+                try {
+                    await context.addCookies(convertCookies(JSON.parse(process.env.GROK_COOKIES)));
+                    console.log('✅ الكوكيز محملة من Railway.');
+                } catch (e) {
+                    console.error('❌ GROK_COOKIES:', e.message);
+                    interaction.channel.send('⚠️ خطأ في GROK_COOKIES!');
+                }
             } else if (fs.existsSync('./cookies.json')) {
                 await context.addCookies(convertCookies(JSON.parse(fs.readFileSync('./cookies.json', 'utf8'))));
-                console.log('✅ الكوكيز محملة من الملف.');
+                console.log('✅ الكوكيز من الملف.');
             } else {
                 interaction.channel.send('⚠️ لم يتم العثور على كوكيز.');
             }
 
             page = await context.newPage();
+
+            // ✅ Inject permission override BEFORE page loads
+            await page.addInitScript(() => {
+                // Make permissions.query always return 'granted' for mic
+                const origQuery = navigator.permissions.query.bind(navigator.permissions);
+                navigator.permissions.query = (p) => {
+                    if (p && (p.name === 'microphone' || p.name === 'camera')) {
+                        return Promise.resolve({ state: 'granted', onchange: null });
+                    }
+                    return origQuery(p);
+                };
+                console.log('[BOT] Permission override injected');
+            });
+
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
             console.log('✅ Grok محمّل.');
 
+            // Grant via CDP after page is open
+            try {
+                cdpSession = await context.newCDPSession(page);
+                await cdpSession.send('Browser.grantPermissions', {
+                    permissions: ['audioCapture'],
+                    origin: 'https://grok.com'
+                });
+                console.log('✅ CDP audioCapture granted');
+            } catch (cdpErr) {
+                console.warn('⚠️ CDP grant failed (non-fatal):', cdpErr.message);
+            }
+
             await activateGrokVoiceMode();
 
+            // ─── Voice connection ─────────────────────────────────────────
             let voiceReadyTimer = null;
             const onReady = (forced = false) => {
                 if (voiceInputReady) return;
@@ -340,20 +462,18 @@ client.on('interactionCreate', async (interaction) => {
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
             };
-
             connection.on(VoiceConnectionStatus.Ready, onReady);
             if (connection.state.status === VoiceConnectionStatus.Ready) onReady();
             else voiceReadyTimer = setTimeout(() => { if (!voiceInputReady && connection) onReady(true); }, 5000);
-
             connection.on(VoiceConnectionStatus.Disconnected, () => console.warn('⚠️ انقطع الاتصال الصوتي'));
 
             await interaction.editReply(
                 '✅ **الجلسة تعمل!**\n' +
                 `🔒 للمستخدم <@${ALLOWED_USER_ID}> فقط\n` +
                 '🔊 صوت Grok → Discord\n' +
-                '🎤 صوتك في القناة → Grok\n' +
-                '💬 اكتب هنا → يُرسل لـ Grok مباشرة (Grok يرد بصوته)\n' +
-                '🖥️ شاهد الشاشة عبر noVNC'
+                '🎤 صوتك → Grok\n' +
+                '💬 اكتب هنا → يُرسل لـ Grok (يرد بصوته)\n' +
+                '🖥️ noVNC لمشاهدة الشاشة'
             );
             await updateVoiceStatus(false);
 
@@ -364,6 +484,7 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
+    // ━━━ /stop ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (interaction.commandName === 'stop') {
         if (!browser) return interaction.reply({ content: '⚠️ لا توجد جلسة نشطة.', ephemeral: true });
         await interaction.reply('🛑 جاري الإيقاف...');
@@ -372,11 +493,13 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
+// ─── Cleanup ──────────────────────────────────────────────────────────────────
 function cleanupAll() {
     if (silenceTimeout)  { clearTimeout(silenceTimeout);  silenceTimeout  = null; }
     if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
     voiceInputReady = false;
     isSendingToGrok = false;
+    if (cdpSession)      { cdpSession.detach().catch(() => {}); cdpSession = null; }
     if (ffmpegOut)       { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     if (ffmpegIn)        { ffmpegIn.kill('SIGKILL');  ffmpegIn  = null; }
     if (grokPassthrough) { grokPassthrough.destroy(); grokPassthrough = null; }
