@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 echo "Cleaning up old locks..."
 rm -f /tmp/.X99-lock
@@ -11,41 +10,38 @@ sleep 1
 echo "Starting Xvfb (Virtual Display)..."
 export DISPLAY=:99
 Xvfb :99 -screen 0 1920x1080x24 -ac &
-XVFB_PID=$!
 
-# Wait until Xvfb is actually accepting connections
+# Poll until display is ready instead of fixed sleep
 for i in $(seq 1 20); do
     xdpyinfo -display :99 >/dev/null 2>&1 && break
-    sleep 0.5
+    sleep 0.3
 done
 echo "✅ Xvfb ready"
 
 # ─── PulseAudio ──────────────────────────────────────────────────────────────
 echo "Starting PulseAudio..."
+# ✅ Use -D (daemonize) — same as original that worked. --start breaks in containers.
+pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false
 
-# Export socket path so ALL child processes (Node, Chrome) share the same server
-export XDG_RUNTIME_DIR=/tmp/runtime-node
-export PULSE_RUNTIME_PATH=/tmp/runtime-node/pulse
-export PULSE_SERVER=unix:/tmp/runtime-node/pulse/native
-mkdir -p "$PULSE_RUNTIME_PATH"
-
-pulseaudio \
-    --start \
-    --exit-idle-time=-1 \
-    --disallow-exit=1 \
-    --disallow-module-loading=0 \
-    --log-level=error \
-    --system=false \
-    --daemonize=yes
-
-# Wait until PulseAudio socket is live (don't rely on sleep)
+# Poll until socket is live instead of fixed sleep
 echo "Waiting for PulseAudio socket..."
-for i in $(seq 1 30); do
+for i in $(seq 1 20); do
     pactl info >/dev/null 2>&1 && break
     sleep 0.3
 done
-pactl info >/dev/null 2>&1 || { echo "❌ PulseAudio failed to start!"; exit 1; }
-echo "✅ PulseAudio ready"
+
+if ! pactl info >/dev/null 2>&1; then
+    echo "⚠️ PulseAudio slow — retrying once..."
+    pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false 2>/dev/null || true
+    sleep 3
+fi
+
+if pactl info >/dev/null 2>&1; then
+    echo "✅ PulseAudio ready"
+else
+    echo "❌ PulseAudio failed to start!"
+    exit 1
+fi
 
 # ─── Virtual devices ─────────────────────────────────────────────────────────
 echo "Creating Virtual Audio Sink (DiscordSink) — Grok audio plays here..."
@@ -61,7 +57,7 @@ pactl load-module module-null-sink \
     rate=48000 channels=2 format=s16le
 
 echo "Creating VirtualMic source from DiscordMic.monitor..."
-# ✅ format=s16le must match DiscordMic — avoids float32le/s16le mismatch Chrome sees
+# ✅ format=s16le matches DiscordMic — avoids float32le mismatch Chrome sees
 pactl load-module module-virtual-source \
     source_name=VirtualMic \
     master=DiscordMic.monitor \
@@ -72,30 +68,15 @@ echo "Setting PulseAudio defaults..."
 pactl set-default-sink DiscordSink
 pactl set-default-source VirtualMic
 
-# ✅ These env vars are inherited by Node.js and Chrome (Playwright)
+# ✅ Inherited by Node.js AND Chrome (Playwright launches it as child process)
 export PULSE_SINK=DiscordSink
 export PULSE_SOURCE=VirtualMic
-# ✅ Low latency for real-time voice (30ms buffer)
+# ✅ 30ms buffer — critical for real-time voice, reduces lag
 export PULSE_LATENCY_MSEC=30
 
 echo "PulseAudio sources and sinks:"
 pactl list short sources
 pactl list short sinks
-
-# ─── Verify routing ───────────────────────────────────────────────────────────
-DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null || pactl info | grep 'Default Sink' | awk '{print $3}')
-DEFAULT_SRC=$(pactl get-default-source 2>/dev/null || pactl info | grep 'Default Source' | awk '{print $3}')
-echo "🔊 Default sink:   $DEFAULT_SINK"
-echo "🎤 Default source: $DEFAULT_SRC"
-
-if [ "$DEFAULT_SINK" != "DiscordSink" ]; then
-    echo "⚠️  Default sink is not DiscordSink — forcing..."
-    pacmd set-default-sink DiscordSink
-fi
-if [ "$DEFAULT_SRC" != "VirtualMic" ]; then
-    echo "⚠️  Default source is not VirtualMic — forcing..."
-    pacmd set-default-source VirtualMic
-fi
 
 # ─── noVNC Setup ─────────────────────────────────────────────────────────────
 NOVNC_PORT=${NOVNC_PORT:-6080}
