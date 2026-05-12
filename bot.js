@@ -100,33 +100,49 @@ client.on('interactionCreate', async (interaction) => {
             // 3. حقن الكوكيز الخاصة بتسجيل الدخول (من Railway Variables أو الملف)
             let cookies = null;
 
+            // دالة لتحويل كوكيز Chrome إلى صيغة Playwright
+            const convertCookies = (rawCookies) => {
+                return rawCookies.map(cookie => {
+                    // تحويل sameSite من صيغة Chrome إلى صيغة Playwright
+                    let sameSite = 'Lax'; // القيمة الافتراضية
+                    
+                    if (cookie.sameSite) {
+                        const sameSiteLower = cookie.sameSite.toLowerCase();
+                        if (sameSiteLower === 'strict') sameSite = 'Strict';
+                        else if (sameSiteLower === 'lax') sameSite = 'Lax';
+                        else if (sameSiteLower === 'none' || sameSiteLower === 'no_restriction') sameSite = 'None';
+                        else sameSite = 'Lax'; // unspecified → Lax
+                    }
+
+                    // تحويل expirationDate (timestamp) إلى expires (Unix timestamp)
+                    const expires = cookie.expirationDate ? Math.floor(cookie.expirationDate) : -1;
+
+                    return {
+                        name: cookie.name,
+                        value: cookie.value,
+                        domain: cookie.domain,
+                        path: cookie.path || '/',
+                        expires: expires,
+                        httpOnly: cookie.httpOnly || false,
+                        secure: cookie.secure || false,
+                        sameSite: sameSite
+                    };
+                });
+            };
+
             if (process.env.GROK_COOKIES) {
                 try {
                     const rawCookies = JSON.parse(process.env.GROK_COOKIES);
-                    
-                    // 🔴 إصلاح مشكلة sameSite: تحويل القيم الخاطئة إلى "Lax"
-                    cookies = rawCookies.map(cookie => {
-                        if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
-                            console.log(`⚠️ تم تعديل sameSite من "${cookie.sameSite}" إلى "Lax" للكوكيز: ${cookie.name}`);
-                            cookie.sameSite = 'Lax';
-                        }
-                        return cookie;
-                    });
-                    
-                    console.log('✅ تم جلب الكوكيز من متغيرات Railway بنجاح.');
+                    cookies = convertCookies(rawCookies);
+                    console.log('✅ تم جلب وتحويل الكوكيز من متغيرات Railway بنجاح.');
                 } catch (err) {
                     console.error('❌ خطأ في تحليل JSON الخاص بالكوكيز من المتغيرات!', err);
                     interaction.channel.send('⚠️ خطأ في قراءة متغير GROK_COOKIES، تأكد من صحة الكود المنسوخ.');
                 }
             } else if (fs.existsSync('./cookies.json')) {
                 const rawCookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
-                cookies = rawCookies.map(cookie => {
-                    if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
-                        cookie.sameSite = 'Lax';
-                    }
-                    return cookie;
-                });
-                console.log('✅ تم جلب الكوكيز من ملف cookies.json المحلي.');
+                cookies = convertCookies(rawCookies);
+                console.log('✅ تم جلب وتحويل الكوكيز من ملف cookies.json المحلي.');
             }
 
             if (cookies) {
