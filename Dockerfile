@@ -55,3 +55,4 @@ EXPOSE 5900
 USER node
 
 ENTRYPOINT ["./entrypoint.sh"]
+
