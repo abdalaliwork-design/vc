@@ -211,24 +211,31 @@ function speakText(text) {
 
 // ─── دالة: استقبال صوت المستخدم → Grok ────────────────────────────────────
 function setupVoiceInput(receiver) {
-    receiver.speaking.on('start', (userId) => {
-        if (userId !== sessionUserId) return;
+    console.log('🎧 تهيئة استقبال صوت المستخدم...');
 
-        // clear any pending "went silent" timer
-        if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
+    function listenToUser() {
+        if (!connection || !sessionUserId) return;
 
-        console.log('🎤 المستخدم يتكلم...');
-        updateVoiceStatus(true);
+        const audioStream = receiver.subscribe(sessionUserId, {
+            end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
+        });
 
-        if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+        let hasData = false;
 
-        const audioStream = receiver.subscribe(userId, {
-            end: { behavior: EndBehaviorType.AfterSilence, duration: 300 }
+        audioStream.on('data', () => {
+            if (!hasData) {
+                hasData = true;
+                if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
+                console.log('🎤 المستخدم يتكلم...');
+                updateVoiceStatus(true);
+            }
         });
 
         const opusDecoder = new prism.opus.Decoder({
             rate: 48000, channels: 2, frameSize: 960
         });
+
+        if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
 
         ffmpegIn = spawn('ffmpeg', [
             '-loglevel', 'warning',
@@ -246,12 +253,22 @@ function setupVoiceInput(receiver) {
         audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin);
 
         audioStream.on('end', () => {
-            console.log('🎤 المستخدم توقف');
+            if (hasData) {
+                console.log('🎤 المستخدم توقف');
+                silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
+            }
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-            // wait 800 ms before marking silent (avoids flicker on short pauses)
-            silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
+            // Re-subscribe immediately to catch the next utterance
+            setTimeout(() => listenToUser(), 100);
         });
-    });
+
+        audioStream.on('error', () => {
+            if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+            setTimeout(() => listenToUser(), 500);
+        });
+    }
+
+    listenToUser();
 }
 
 // ─── حدث: جاهزية البوت ─────────────────────────────────────────────────────
@@ -320,7 +337,8 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
                     '--use-fake-ui-for-media-stream',
-                    '--use-fake-device-for-media-stream'
+                    // NOTE: do NOT use --use-fake-device-for-media-stream
+                    // that replaces PulseAudio with a silent fake device
                 ]
             });
 
