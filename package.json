@@ -1,7 +1,7 @@
 {
   "name": "grok-discord-bot",
   "version": "1.0.0",
-  "description": "Discord bot that bridges Grok voice with Discord voice channels",
+  "description": "Discord bot bridging Grok voice with Discord",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
