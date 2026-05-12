@@ -170,6 +170,7 @@ function speakText(text) {
         const espeak = spawn('espeak', ['-v', lang, '-s', '150', '--stdout', text]);
         const ffmpeg = spawn('ffmpeg', [
             '-loglevel', 'warning',
+            '-fflags', '+genpts+igndts',
             '-f', 'wav',
             '-i', 'pipe:0',
             '-ar', '48000',
@@ -347,6 +348,7 @@ client.on('interactionCreate', async (interaction) => {
             const onReady = () => {
                 if (voiceInputReady) return;
                 voiceInputReady = true;
+                if (voiceReadyTimer) { clearTimeout(voiceReadyTimer); voiceReadyTimer = null; }
                 console.log('✅ الاتصال الصوتي جاهز!');
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
