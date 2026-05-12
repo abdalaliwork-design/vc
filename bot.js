@@ -238,70 +238,175 @@ function setupVoiceInput(receiver) {
 async function activateGrokVoiceMode() {
     if (!page) return;
     console.log('🎙️ تفعيل وضع الصوت في Grok...');
-    try {
-        // Dismiss Connectors popup if present
-        try {
-            await page.click('text=Dismiss', { timeout: 2000 });
-            console.log('✅ أُغلقت نافذة Connectors');
-        } catch { /* no popup */ }
 
+    // Handle any JS dialogs that might block clicks
+    page.on('dialog', async dialog => {
+        console.log(`📢 Dialog: ${dialog.type()} — ${dialog.message()}`);
+        await dialog.dismiss();
+    });
+
+    try {
+        // ── Step 1: Dismiss any popups / overlays ─────────────────────────
+        const dismissSelectors = [
+            'button:has-text("Dismiss")',
+            'button:has-text("Got it")',
+            'button:has-text("Close")',
+            '[aria-label="Close"]',
+            '[aria-label="Dismiss"]',
+        ];
+        for (const sel of dismissSelectors) {
+            try {
+                await page.click(sel, { timeout: 1500 });
+                console.log(`✅ أُغلق: ${sel}`);
+                await page.waitForTimeout(400);
+            } catch { /* not present */ }
+        }
+
+        // ── Step 2: Wait for the input area to be ready ───────────────────
+        try {
+            await page.waitForSelector('form, textarea, [role="textbox"]', { timeout: 10000, state: 'visible' });
+            console.log('✅ منطقة الإدخال جاهزة');
+        } catch {
+            console.warn('⚠️ لم تظهر منطقة الإدخال بعد 10 ثوانٍ');
+        }
         await page.waitForTimeout(800);
 
-        // Click the voice/waveform button
-        const voiceClicked = await page.evaluate(() => {
-            const allButtons = Array.from(document.querySelectorAll('button'));
+        // ── Step 3: Try specific Grok voice button selectors first ────────
+        const voiceButtonSelectors = [
+            // Grok's actual voice mode button (by aria-label)
+            'button[aria-label*="voice" i]',
+            'button[aria-label*="Voice" i]',
+            'button[aria-label*="mic" i]',
+            'button[aria-label*="Mic" i]',
+            'button[aria-label*="audio" i]',
+            'button[aria-label*="speak" i]',
+            // data-testid patterns Grok might use
+            '[data-testid*="voice"]',
+            '[data-testid*="mic"]',
+            // Title attribute fallbacks
+            'button[title*="voice" i]',
+            'button[title*="mic" i]',
+        ];
 
-            // Strategy 1: aria-label containing voice/mic/audio
-            for (const btn of allButtons) {
-                const label = (btn.getAttribute('aria-label') || btn.title || btn.textContent || '').toLowerCase();
-                if (label.includes('voice') || label.includes('mic') || label.includes('audio') || label.includes('speak')) {
-                    btn.click();
-                    return `aria-label: ${label}`;
+        let clicked = false;
+        for (const sel of voiceButtonSelectors) {
+            try {
+                const btn = await page.waitForSelector(sel, { timeout: 2000, state: 'visible' });
+                if (btn) {
+                    await btn.scrollIntoViewIfNeeded();
+                    await btn.click({ force: true });
+                    console.log(`✅ [Strategy-1] نقر على: ${sel}`);
+                    clicked = true;
+                    break;
                 }
-            }
+            } catch { /* try next */ }
+        }
 
-            // Strategy 2: Dark filled button in form (Grok's voice button)
-            const form = document.querySelector('form');
-            if (form) {
-                const btns = Array.from(form.querySelectorAll('button'));
-                for (const btn of btns) {
-                    const style = window.getComputedStyle(btn);
-                    const bg = style.backgroundColor;
-                    if (bg && (bg.includes('0, 0, 0') || bg.includes('rgb(0') || btn.classList.toString().includes('bg-'))) {
+        // ── Step 4: Fallback — scan all buttons by text/SVG heuristics ────
+        if (!clicked) {
+            const result = await page.evaluate(() => {
+                const allBtns = Array.from(document.querySelectorAll('button'));
+
+                // 4a: Match by any voice/mic keyword in accessible text
+                for (const btn of allBtns) {
+                    const text = [
+                        btn.getAttribute('aria-label'),
+                        btn.getAttribute('title'),
+                        btn.textContent,
+                    ].filter(Boolean).join(' ').toLowerCase();
+                    if (/voice|mic|audio|speak|waveform|sound/.test(text)) {
                         btn.click();
-                        return `dark-bg-button: ${btn.className.substring(0, 50)}`;
+                        return `text-match: "${text.substring(0, 60)}"`;
                     }
                 }
-                if (btns.length > 0) {
-                    btns[btns.length - 1].click();
-                    return `last-form-button (${btns.length} buttons found)`;
-                }
-            }
 
-            // Strategy 3: SVG waveform button in bottom half of screen
-            for (const btn of allButtons) {
-                const svgPaths = btn.querySelectorAll('svg path');
-                if (svgPaths.length >= 3) {
+                // 4b: Grok's voice button sits in the form's bottom-right area
+                //     It's typically a round button with a microphone/waveform SVG
+                const form = document.querySelector('form');
+                if (form) {
+                    const btns = Array.from(form.querySelectorAll('button'));
+                    // Prefer buttons with an SVG child and at least 2 paths (waveform)
+                    for (const btn of btns) {
+                        const paths = btn.querySelectorAll('svg path, svg rect, svg circle');
+                        if (paths.length >= 2) {
+                            const rect = btn.getBoundingClientRect();
+                            // Must be in the lower portion of the viewport
+                            if (rect.top > window.innerHeight * 0.55 && rect.width > 0) {
+                                btn.click();
+                                return `svg-form-btn at y=${Math.round(rect.top)} paths=${paths.length}`;
+                            }
+                        }
+                    }
+                    // Last resort: last visible button in form
+                    const visibleBtns = btns.filter(b => {
+                        const r = b.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    if (visibleBtns.length > 0) {
+                        visibleBtns[visibleBtns.length - 1].click();
+                        return `last-form-btn (total ${visibleBtns.length})`;
+                    }
+                }
+
+                // 4c: Any round button in the bottom half of the screen
+                for (const btn of allBtns) {
                     const rect = btn.getBoundingClientRect();
-                    if (rect.bottom > window.innerHeight * 0.6) {
+                    const style = window.getComputedStyle(btn);
+                    const radius = parseInt(style.borderRadius) || 0;
+                    if (radius >= 20 && rect.top > window.innerHeight * 0.6 && rect.width > 0) {
                         btn.click();
-                        return `svg-waveform at y=${rect.bottom}`;
+                        return `round-btn at y=${Math.round(rect.top)} r=${radius}`;
                     }
                 }
+
+                return null;
+            });
+
+            if (result) {
+                console.log(`✅ [Strategy-2] نقر: ${result}`);
+                clicked = true;
+            } else {
+                console.warn('⚠️ [Strategy-2] لم يُعثر على زر الصوت');
             }
+        }
 
-            return false;
+        await page.waitForTimeout(1200);
+
+        // ── Step 5: Verify mic permission dialog and accept it ─────────────
+        // Chrome may show a permission bubble after clicking voice
+        try {
+            // Re-grant via CDP in case the origin changed after navigation
+            if (cdpSession) {
+                await cdpSession.send('Browser.grantPermissions', {
+                    permissions: ['audioCapture', 'videoCapture'],
+                    origin: 'https://grok.com'
+                });
+                console.log('✅ CDP mic re-granted after voice button click');
+            }
+        } catch (e) {
+            console.warn('⚠️ CDP re-grant:', e.message);
+        }
+
+        // ── Step 6: Confirm voice mode is active ──────────────────────────
+        await page.waitForTimeout(800);
+        const inVoiceMode = await page.evaluate(() => {
+            // Voice mode: textarea hidden OR a mic/waveform animation visible
+            const ta = document.querySelector('textarea');
+            const textareaHidden = !ta || ta.offsetParent === null;
+
+            // Also check for any animated voice UI element
+            const voiceUI = document.querySelector(
+                '[class*="voice"], [class*="mic"], [class*="waveform"], [class*="listening"]'
+            );
+            return textareaHidden || !!voiceUI;
         });
 
-        console.log(`🎙️ نتيجة النقر على زر الصوت: ${voiceClicked}`);
+        if (inVoiceMode) {
+            console.log('✅ وضع الصوت مُفعَّل — الميكروفون يستمع 🎤');
+        } else {
+            console.warn('⚠️ قد يكون وضع الصوت غير مُفعَّل — سيتم المحاولة بـ Ctrl+Shift+O');
+        }
 
-        // Handle any JS dialogs
-        page.on('dialog', async dialog => {
-            console.log(`📢 Dialog: ${dialog.type()} — ${dialog.message()}`);
-            await dialog.dismiss();
-        });
-
-        await page.waitForTimeout(1000);
         console.log('✅ activateGrokVoiceMode مكتمل');
 
     } catch (err) {
@@ -464,16 +569,25 @@ client.on('interactionCreate', async (interaction) => {
                 console.warn('⚠️ CDP grant failed (non-fatal):', cdpErr.message);
             }
 
-            await page.goto('https://grok.com', { waitUntil: 'networkidle' });
+            // ✅ Use domcontentloaded — grok.com never reaches networkidle (keeps WS alive)
+            try {
+                await page.goto('https://grok.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            } catch (navErr) {
+                // If even domcontentloaded times out, try load event
+                console.warn('⚠️ domcontentloaded timeout, retrying with load...');
+                await page.goto('https://grok.com', { waitUntil: 'load', timeout: 60000 });
+            }
+            // Wait for page to settle (React hydration, lazy loads)
+            await page.waitForTimeout(3000);
             console.log('✅ Grok محمّل.');
 
             await activateGrokVoiceMode();
 
-            // ✅ If button click didn't activate voice mode, use keyboard shortcut Ctrl+Shift+O
+            // ✅ Retry voice mode via keyboard shortcut if button click didn't work
             await page.waitForTimeout(1500);
             const stillTextMode = await page.evaluate(() => {
                 const ta = document.querySelector('textarea');
-                return ta && ta.offsetParent !== null; // textarea visible = still text mode
+                return ta && ta.offsetParent !== null;
             });
             if (stillTextMode) {
                 console.warn('⚠️ لا يزال في وضع النص — تجربة Ctrl+Shift+O');
