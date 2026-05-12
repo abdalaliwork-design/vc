@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     dbus-x11 \
     sudo \
+    x11vnc \
+    novnc \
+    websockify \
+    net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
@@ -42,6 +46,11 @@ RUN chmod -R 777 /ms-playwright
 
 COPY . .
 RUN chmod +x entrypoint.sh && chown -R node:node /app
+
+# noVNC port
+EXPOSE 6080
+# VNC port
+EXPOSE 5900
 
 USER node
 
