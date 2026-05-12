@@ -164,31 +164,48 @@ function speakText(text) {
     return new Promise((resolve) => {
         const isArabic = /[\u0600-\u06FF]/.test(text);
         const lang = isArabic ? 'ar' : 'en';
+        const tmpFile = `/tmp/tts_${Date.now()}.wav`;
 
         console.log(`💬 TTS [${lang}]: ${text.substring(0, 60)}`);
 
-        const espeak = spawn('espeak', ['-v', lang, '-s', '150', '--stdout', text]);
-        const ffmpeg = spawn('ffmpeg', [
-            '-loglevel', 'warning',
-            '-fflags', '+genpts+igndts',
-            '-f', 'wav',
-            '-i', 'pipe:0',
-            '-ar', '48000',
-            '-ac', '2',
-            '-f', 'pulse',
-            'DiscordSink'
-        ]);
+        // Step 1: espeak writes a complete WAV file (avoids pipe header corruption)
+        const espeak = spawn('espeak', ['-v', lang, '-s', '150', '-w', tmpFile, text]);
 
-        espeak.stdout.pipe(ffmpeg.stdin);
-        espeak.stderr.on('data', () => {});
-        ffmpeg.stderr.on('data', d => {
-            const msg = d.toString().trim();
-            if (msg && !msg.includes('Guessed')) console.error('[TTS]', msg);
+        espeak.on('error', err => {
+            console.error('❌ espeak error:', err.message);
+            resolve();
         });
 
-        espeak.on('error', err => { console.error('❌ espeak error:', err.message); resolve(); });
-        ffmpeg.on('error', err => { console.error('❌ TTS-ffmpeg error:', err.message); resolve(); });
-        ffmpeg.on('exit', () => { console.log('✅ TTS انتهى'); resolve(); });
+        espeak.on('exit', (code) => {
+            if (code !== 0) { console.error(`❌ espeak exited ${code}`); return resolve(); }
+
+            // Step 2: ffmpeg reads the complete file — no header issues
+            const ffmpeg = spawn('ffmpeg', [
+                '-loglevel', 'warning',
+                '-i', tmpFile,
+                '-ar', '48000',
+                '-ac', '2',
+                '-f', 'pulse',
+                'DiscordSink'
+            ]);
+
+            ffmpeg.stderr.on('data', d => {
+                const msg = d.toString().trim();
+                if (msg) console.error('[TTS]', msg);
+            });
+
+            ffmpeg.on('error', err => {
+                console.error('❌ TTS-ffmpeg error:', err.message);
+                fs.unlink(tmpFile, () => {});
+                resolve();
+            });
+
+            ffmpeg.on('exit', () => {
+                console.log('✅ TTS انتهى');
+                fs.unlink(tmpFile, () => {}); // clean up temp file
+                resolve();
+            });
+        });
     });
 }
 
@@ -345,11 +362,12 @@ client.on('interactionCreate', async (interaction) => {
             console.log('✅ Grok محمّل.');
 
             let voiceReadyTimer = null;
-            const onReady = () => {
+            const onReady = (forced = false) => {
                 if (voiceInputReady) return;
                 voiceInputReady = true;
                 if (voiceReadyTimer) { clearTimeout(voiceReadyTimer); voiceReadyTimer = null; }
-                console.log('✅ الاتصال الصوتي جاهز!');
+                if (forced) console.warn('⚠️ Ready لم يصل — تهيئة إجبارية');
+                else        console.log('✅ الاتصال الصوتي جاهز!');
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
             };
@@ -362,10 +380,7 @@ client.on('interactionCreate', async (interaction) => {
             } else {
                 // Fallback: force-init after 5 s regardless
                 voiceReadyTimer = setTimeout(() => {
-                    if (!voiceInputReady && connection) {
-                        console.warn('⚠️ Ready لم يصل — تهيئة إجبارية');
-                        onReady();
-                    }
+                    if (!voiceInputReady && connection) onReady(true);
                 }, 5000);
             }
 
