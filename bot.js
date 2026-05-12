@@ -1,9 +1,10 @@
 const { Client, GatewayIntentBits, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, NoSubscriberBehavior, VoiceConnectionStatus, EndBehaviorType } = require('@discordjs/voice');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const { spawn } = require('child_process');
 const fs = require('fs');
+const prism = require('prism-media');
 
 // تفعيل إضافة التخفي للمتصفح
 chromium.use(stealth);
@@ -20,12 +21,13 @@ const client = new Client({
 // متغيرات عامة لإدارة الجلسة
 let browser = null;
 let page = null;
-let ffmpegProcess = null;
+let ffmpegProcessOut = null; // لإرسال صوت Grok إلى Discord
+let ffmpegProcessIn = null;  // لإرسال صوتك إلى Grok
 let connection = null;
 let player = null;
 
 // تعريف أوامر السلاش (Slash Commands)
-const commands =[
+const commands = [
     {
         name: 'start',
         description: 'يبدأ تشغيل متصفح Grok وبث الصوت إلى القناة الصوتية 🎙️',
@@ -36,7 +38,7 @@ const commands =[
     }
 ];
 
-client.on('ready', async () => {
+client.on('clientReady', async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
 
     // تسجيل الأوامر في ديسكورد لتظهر في القائمة
@@ -74,34 +76,56 @@ client.on('interactionCreate', async (interaction) => {
                 channelId: voiceChannel.id,
                 guildId: interaction.guild.id,
                 adapterCreator: interaction.guild.voiceAdapterCreator,
+                selfDeaf: false, // 🔴 مهم جداً: عدم كتم السماعات لاستقبال صوتك
+                selfMute: false
             });
 
             // 2. تشغيل المتصفح (Headless: false) داخل شاشة Xvfb الوهمية لضمان عمل الصوت
             browser = await chromium.launch({
                 headless: false, 
-                args:[
+                args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage', // مهم لتقليل استهلاك الرام في Railway
-                    '--autoplay-policy=no-user-gesture-required' // السماح بتشغيل الصوت تلقائياً
+                    '--disable-dev-shm-usage',
+                    '--autoplay-policy=no-user-gesture-required',
+                    '--use-fake-ui-for-media-stream', // 🔴 السماح للمتصفح باستخدام الميكروفون دون طلب إذن
+                    '--use-fake-device-for-media-stream'
                 ]
             });
 
-            const context = await browser.newContext();
+            const context = await browser.newContext({
+                permissions: ['microphone'] // 🔴 منح صلاحية الميكروفون للمتصفح
+            });
 
             // 3. حقن الكوكيز الخاصة بتسجيل الدخول (من Railway Variables أو الملف)
             let cookies = null;
 
             if (process.env.GROK_COOKIES) {
                 try {
-                    cookies = JSON.parse(process.env.GROK_COOKIES);
+                    const rawCookies = JSON.parse(process.env.GROK_COOKIES);
+                    
+                    // 🔴 إصلاح مشكلة sameSite: تحويل القيم الخاطئة إلى "Lax"
+                    cookies = rawCookies.map(cookie => {
+                        if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
+                            console.log(`⚠️ تم تعديل sameSite من "${cookie.sameSite}" إلى "Lax" للكوكيز: ${cookie.name}`);
+                            cookie.sameSite = 'Lax';
+                        }
+                        return cookie;
+                    });
+                    
                     console.log('✅ تم جلب الكوكيز من متغيرات Railway بنجاح.');
                 } catch (err) {
                     console.error('❌ خطأ في تحليل JSON الخاص بالكوكيز من المتغيرات!', err);
                     interaction.channel.send('⚠️ خطأ في قراءة متغير GROK_COOKIES، تأكد من صحة الكود المنسوخ.');
                 }
             } else if (fs.existsSync('./cookies.json')) {
-                cookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
+                const rawCookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
+                cookies = rawCookies.map(cookie => {
+                    if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
+                        cookie.sameSite = 'Lax';
+                    }
+                    return cookie;
+                });
                 console.log('✅ تم جلب الكوكيز من ملف cookies.json المحلي.');
             }
 
@@ -115,25 +139,61 @@ client.on('interactionCreate', async (interaction) => {
             page = await context.newPage();
             await page.goto('https://grok.com', { waitUntil: 'networkidle' });
 
-            // 4. تشغيل FFmpeg لسحب الصوت من الـ Monitor الخاص بـ DiscordSink
-            ffmpegProcess = spawn('ffmpeg',[
+            // 4. ربط صوت Discord بالمتصفح (لإرسال صوتك إلى Grok)
+            const receiver = connection.receiver;
+            
+            connection.on(VoiceConnectionStatus.Ready, () => {
+                console.log('✅ اتصال الصوت جاهز!');
+                
+                // الاستماع لصوت المستخدم الذي استدعى الأمر
+                const audioStream = receiver.subscribe(interaction.user.id, {
+                    end: {
+                        behavior: EndBehaviorType.AfterSilence,
+                        duration: 100
+                    }
+                });
+
+                // تحويل Opus إلى PCM
+                const opusDecoder = new prism.opus.Decoder({
+                    rate: 48000,
+                    channels: 2,
+                    frameSize: 960
+                });
+
+                // 🔴 إرسال صوتك إلى DiscordMic (ليسمعه Grok)
+                ffmpegProcessIn = spawn('ffmpeg', [
+                    '-f', 's16le',
+                    '-ar', '48000',
+                    '-ac', '2',
+                    '-i', 'pipe:0',
+                    '-f', 'pulse',
+                    'DiscordMic'
+                ]);
+
+                audioStream.pipe(opusDecoder).pipe(ffmpegProcessIn.stdin);
+
+                console.log('🎤 تم ربط صوتك بـ Grok!');
+            });
+
+            // 5. تشغيل FFmpeg لسحب صوت Grok من الـ Monitor الخاص بـ DiscordSink
+            ffmpegProcessOut = spawn('ffmpeg', [
                 '-f', 'pulse',
                 '-i', 'DiscordSink.monitor', // التقاط الصوت من المخرج الوهمي
-                '-fflags', 'nobuffer',       // منع التخزين المؤقت لتسريع النقل
-                '-flags', 'low_delay',       // فرض وضع الـ Low Delay
-                '-ac', '2',                  // قنوات الصوت (Stereo)
-                '-ar', '48000',              // معدل التردد الصوتي القياسي لديسكورد
-                '-f', 's16le',               // صيغة الإخراج الخام
+                '-fflags', 'nobuffer',
+                '-flags', 'low_delay',
+                '-ac', '2',
+                '-ar', '48000',
+                '-f', 's16le',
                 '-acodec', 'pcm_s16le',
-                'pipe:1'                     // إرسال الناتج إلى stdout
+                'pipe:1'
             ]);
 
-            // 5. ربط مخرج FFmpeg بمحرك صوت ديسكورد
+            // 6. ربط مخرج FFmpeg بمحرك صوت ديسكورد
             player = createAudioPlayer({
                 behaviors: { noSubscriber: NoSubscriberBehavior.Play }
             });
 
-            const resource = createAudioResource(ffmpegProcess.stdout, {
+            const resource = createAudioResource(ffmpegProcessOut.stdout, {
                 inputType: StreamType.Raw,
             });
 
@@ -141,7 +201,7 @@ client.on('interactionCreate', async (interaction) => {
             connection.subscribe(player);
 
             // تعديل الرسالة لتأكيد اكتمال الربط
-            await interaction.editReply('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل (على grok.com) والصوت يتم بثه الآن إلى القناة.');
+            await interaction.editReply('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل (على grok.com) والصوت ثنائي الاتجاه يعمل الآن:\n🔊 صوت Grok → Discord\n🎤 صوتك → Grok');
 
         } catch (error) {
             console.error(error);
@@ -155,10 +215,14 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.reply('🛑 جاري إيقاف الجلسة وتفريغ الذاكرة (RAM)...');
 
-        // إيقاف FFmpeg
-        if (ffmpegProcess) {
-            ffmpegProcess.kill('SIGKILL');
-            ffmpegProcess = null;
+        // إيقاف FFmpeg (المخرج والمدخل)
+        if (ffmpegProcessOut) {
+            ffmpegProcessOut.kill('SIGKILL');
+            ffmpegProcessOut = null;
+        }
+        if (ffmpegProcessIn) {
+            ffmpegProcessIn.kill('SIGKILL');
+            ffmpegProcessIn = null;
         }
 
         // إغلاق المتصفح تماماً
