@@ -202,6 +202,8 @@ function setupVoiceInput(receiver) {
                 updateVoiceStatus(true);
             }
         });
+        // ✅ Log subscription so we know it's actively listening
+        console.log(`🔔 [VOICE] مشترك في صوت المستخدم — في انتظار الصوت...`);
         if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
         ffmpegIn = spawn('ffmpeg', [
             '-loglevel', 'warning',
@@ -403,14 +405,17 @@ async function activateGrokVoiceMode() {
 
         if (inVoiceMode) {
             console.log('✅ وضع الصوت مُفعَّل — الميكروفون يستمع 🎤');
+            console.log('✅ activateGrokVoiceMode مكتمل');
+            return true;   // ← caller must NOT send Ctrl+Shift+O (would toggle OFF)
         } else {
-            console.warn('⚠️ قد يكون وضع الصوت غير مُفعَّل — سيتم المحاولة بـ Ctrl+Shift+O');
+            console.warn('⚠️ وضع الصوت غير مُفعَّل بعد — يحتاج Ctrl+Shift+O');
+            console.log('✅ activateGrokVoiceMode مكتمل');
+            return false;  // ← caller should try Ctrl+Shift+O
         }
-
-        console.log('✅ activateGrokVoiceMode مكتمل');
 
     } catch (err) {
         console.error('❌ activateGrokVoiceMode:', err.message);
+        return false;
     }
 }
 
@@ -581,16 +586,12 @@ client.on('interactionCreate', async (interaction) => {
             await page.waitForTimeout(3000);
             console.log('✅ Grok محمّل.');
 
-            await activateGrokVoiceMode();
+            const voiceActivated = await activateGrokVoiceMode();
 
-            // ✅ Retry voice mode via keyboard shortcut if button click didn't work
-            await page.waitForTimeout(1500);
-            const stillTextMode = await page.evaluate(() => {
-                const ta = document.querySelector('textarea');
-                return ta && ta.offsetParent !== null;
-            });
-            if (stillTextMode) {
-                console.warn('⚠️ لا يزال في وضع النص — تجربة Ctrl+Shift+O');
+            // ✅ Only try Ctrl+Shift+O if the button click failed — NOT if it succeeded
+            //    (Ctrl+Shift+O is a toggle — sending it when already active turns voice OFF)
+            if (!voiceActivated) {
+                console.warn('⚠️ زر الصوت فشل — تجربة Ctrl+Shift+O');
                 await page.keyboard.down('Control');
                 await page.keyboard.down('Shift');
                 await page.keyboard.press('O');
@@ -599,24 +600,38 @@ client.on('interactionCreate', async (interaction) => {
                 await page.waitForTimeout(2000);
                 console.log('✅ تم إرسال Ctrl+Shift+O');
             } else {
-                console.log('✅ وضع الصوت مفعّل بنجاح');
+                console.log('✅ وضع الصوت مفعّل بنجاح — لا حاجة لـ Ctrl+Shift+O');
             }
 
             // ─── Voice connection ─────────────────────────────────────────
-            let voiceReadyTimer = null;
-            const onReady = (forced = false) => {
-                if (voiceInputReady) return;
+            // ✅ Wait for Ready with a proper Promise so we never miss the event
+            //    (joinVoiceChannel was called earlier; Ready may have already fired)
+            await new Promise((resolve) => {
+                if (connection.state.status === VoiceConnectionStatus.Ready) {
+                    console.log('✅ الاتصال الصوتي كان جاهزاً بالفعل');
+                    return resolve();
+                }
+                const timer = setTimeout(() => {
+                    console.warn('⚠️ تهيئة إجبارية — لم يصل Ready في 8 ثوانٍ');
+                    resolve();
+                }, 8000);
+                connection.once(VoiceConnectionStatus.Ready, () => {
+                    clearTimeout(timer);
+                    console.log('✅ الاتصال الصوتي جاهز!');
+                    resolve();
+                });
+            });
+
+            if (!voiceInputReady) {
                 voiceInputReady = true;
-                if (voiceReadyTimer) { clearTimeout(voiceReadyTimer); voiceReadyTimer = null; }
-                if (forced) console.warn('⚠️ تهيئة إجبارية');
-                else        console.log('✅ الاتصال الصوتي جاهز!');
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
-            };
-            connection.on(VoiceConnectionStatus.Ready, onReady);
-            if (connection.state.status === VoiceConnectionStatus.Ready) onReady();
-            else voiceReadyTimer = setTimeout(() => { if (!voiceInputReady && connection) onReady(true); }, 5000);
-            connection.on(VoiceConnectionStatus.Disconnected, () => console.warn('⚠️ انقطع الاتصال الصوتي'));
+            }
+
+            connection.on(VoiceConnectionStatus.Disconnected, () => {
+                console.warn('⚠️ انقطع الاتصال الصوتي');
+                voiceInputReady = false;
+            });
 
             await interaction.editReply(
                 '✅ **الجلسة تعمل!**\n' +
