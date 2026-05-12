@@ -7,7 +7,8 @@ const {
     NoSubscriberBehavior,
     VoiceConnectionStatus,
     EndBehaviorType,
-    AudioPlayerStatus
+    AudioPlayerStatus,
+    entersState,
 } = require('@discordjs/voice');
 const { addExtra } = require('playwright-extra');
 const { chromium: playwrightChromium } = require('playwright');
@@ -187,13 +188,34 @@ function setupVoiceInput(receiver) {
     console.log(`🎧 استقبال صوت: ${ALLOWED_USER_ID}`);
     function listenToUser() {
         if (!connection || !sessionUserId) return;
+
         const audioStream = receiver.subscribe(ALLOWED_USER_ID, {
             end: { behavior: EndBehaviorType.AfterSilence, duration: 600 }
         });
+        console.log(`🔔 [VOICE] مشترك في صوت المستخدم — في انتظار الصوت...`);
+
         let hasData = false;
-        const pcmChunks = [];
+
+        // ✅ Spawn FFmpeg first so it's ready to receive piped audio immediately
+        if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+        ffmpegIn = spawn('ffmpeg', [
+            '-loglevel', 'warning',
+            '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
+            '-af', 'aresample=async=1000,aresample=48000',
+            '-f', 'pulse',
+            'DiscordMic',   // ✅ target the sink directly (not -device flag which is wrong)
+        ]);
+        ffmpegIn.stderr.on('data', d => {
+            const m = d.toString().trim();
+            if (m && !m.includes('Guessed') && !m.includes('monoton')) console.error('[FFmpeg-IN]', m);
+        });
+        ffmpegIn.on('error', err => console.error('❌ FFmpeg-IN spawn:', err.message));
+        ffmpegIn.stdin.on('error', () => {}); // prevent EPIPE crash
+
+        // ✅ Decode Opus → PCM → FFmpeg stdin
         const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-        opusDecoder.on('data', chunk => pcmChunks.push(chunk));
+        opusDecoder.on('error', err => console.error('❌ OpusDecoder:', err.message));
+
         audioStream.on('data', () => {
             if (!hasData) {
                 hasData = true;
@@ -202,33 +224,21 @@ function setupVoiceInput(receiver) {
                 updateVoiceStatus(true);
             }
         });
-        // ✅ Log subscription so we know it's actively listening
-        console.log(`🔔 [VOICE] مشترك في صوت المستخدم — في انتظار الصوت...`);
-        if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-        ffmpegIn = spawn('ffmpeg', [
-            '-loglevel', 'warning',
-            '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
-            '-af', 'aresample=48000',      // ✅ explicit resample
-            '-f', 'pulse',
-            '-device', 'DiscordMic',       // ✅ explicit sink device
-            'default'
-        ]);
-        ffmpegIn.stderr.on('data', d => {
-            const m = d.toString().trim();
-            if (m && !m.includes('Guessed')) console.error('[FFmpeg-IN]', m);
-        });
-        ffmpegIn.on('error', err => console.error('❌ FFmpeg-IN:', err.message));
-        audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin);
+
+        audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin, { end: false });
+
         audioStream.on('end', () => {
             if (hasData) {
-                const sz = Buffer.concat(pcmChunks).length;
-                console.log(`🎤 [STOPPED] ${(sz/1024).toFixed(1)} KB`);
+                console.log(`🎤 [STOPPED] انتهى الصوت`);
                 silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
             }
+            opusDecoder.unpipe(ffmpegIn.stdin);
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
             setTimeout(() => listenToUser(), 100);
         });
-        audioStream.on('error', () => {
+
+        audioStream.on('error', (err) => {
+            console.error('❌ audioStream error:', err.message);
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
             setTimeout(() => listenToUser(), 500);
         });
@@ -491,15 +501,14 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
-                    // ✅ REMOVED --use-fake-device-for-media-stream — that flag makes Chrome
-                    //    use a silent fake mic instead of VirtualMic (PulseAudio). Without it,
-                    //    Chrome uses the real PulseAudio default source (VirtualMic).
+                    // ✅ Suppresses the mic/camera PERMISSION DIALOG without faking the device
+                    //    (different from --use-fake-device-for-media-stream which silences audio)
+                    '--use-fake-ui-for-media-stream',
                     '--allow-file-access-from-files',
                     '--disable-web-security',
                     '--disable-features=WebRtcHideLocalIpsWithMdns',
-                    // ✅ Tell Chrome explicitly to use PulseAudio
-                    '--alsa-output-device=pulse',
-                    '--disable-audio-output',
+                    // ✅ Force Chrome to use PulseAudio for both input and output
+                    '--enable-features=PulseAudio',
                 ]
             });
 
@@ -608,33 +617,67 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // ─── Voice connection ─────────────────────────────────────────
-            // ✅ Wait for Ready with a proper Promise so we never miss the event
-            //    (joinVoiceChannel was called earlier; Ready may have already fired)
+            // ✅ Proper Ready wait — handles case where Ready already fired before we get here
             await new Promise((resolve) => {
-                if (connection.state.status === VoiceConnectionStatus.Ready) {
+                const status = connection.state.status;
+                console.log(`🔗 Voice connection state: ${status}`);
+
+                if (status === VoiceConnectionStatus.Ready) {
                     console.log('✅ الاتصال الصوتي كان جاهزاً بالفعل');
                     return resolve();
                 }
+
+                // If destroyed/disconnected already, just proceed with forced init
+                if (status === VoiceConnectionStatus.Destroyed ||
+                    status === VoiceConnectionStatus.Disconnected) {
+                    console.warn(`⚠️ الاتصال في حالة ${status} — متابعة بدون انتظار`);
+                    return resolve();
+                }
+
                 const timer = setTimeout(() => {
-                    console.warn('⚠️ تهيئة إجبارية — لم يصل Ready في 8 ثوانٍ');
+                    console.warn(`⚠️ تهيئة إجبارية — الحالة: ${connection.state.status}`);
                     resolve();
-                }, 8000);
+                }, 10000);
+
                 connection.once(VoiceConnectionStatus.Ready, () => {
                     clearTimeout(timer);
                     console.log('✅ الاتصال الصوتي جاهز!');
                     resolve();
                 });
+
+                // Also resolve if it disconnects (avoid hanging)
+                connection.once(VoiceConnectionStatus.Disconnected, () => {
+                    clearTimeout(timer);
+                    console.warn('⚠️ انقطع الاتصال أثناء الانتظار');
+                    resolve();
+                });
             });
 
-            if (!voiceInputReady) {
+            if (!voiceInputReady && connection.state.status !== VoiceConnectionStatus.Destroyed) {
                 voiceInputReady = true;
                 setupVoiceInput(connection.receiver);
                 setTimeout(() => startGrokAudio(), 2000);
             }
 
-            connection.on(VoiceConnectionStatus.Disconnected, () => {
-                console.warn('⚠️ انقطع الاتصال الصوتي');
+            connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                console.warn('⚠️ انقطع الاتصال — محاولة إعادة الاتصال...');
                 voiceInputReady = false;
+                try {
+                    await Promise.race([
+                        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+                        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+                    ]);
+                    // Reconnected — wait for Ready again
+                    await entersState(connection, VoiceConnectionStatus.Ready, 10000);
+                    console.log('✅ أُعيد الاتصال الصوتي!');
+                    if (!voiceInputReady) {
+                        voiceInputReady = true;
+                        setupVoiceInput(connection.receiver);
+                    }
+                } catch {
+                    console.error('❌ فشل إعادة الاتصال — تنظيف...');
+                    cleanupAll();
+                }
             });
 
             await interaction.editReply(
