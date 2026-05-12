@@ -3,6 +3,7 @@ FROM node:18-bullseye
 RUN apt-get update && apt-get install -y \
     xvfb \
     pulseaudio \
+    pulseaudio-utils \
     ffmpeg \
     espeak \
     libnss3 \
@@ -35,7 +36,6 @@ ENV XDG_RUNTIME_DIR=/tmp/runtime-node
 RUN mkdir -p /tmp/runtime-node && chown -R node:node /tmp/runtime-node && chmod 700 /tmp/runtime-node
 
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm install --legacy-peer-deps
 
@@ -53,5 +53,4 @@ EXPOSE 6080
 EXPOSE 5900
 
 USER node
-
 ENTRYPOINT ["./entrypoint.sh"]
