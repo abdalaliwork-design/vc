@@ -1,5 +1,11 @@
 #!/bin/bash
 
+echo "Cleaning up old locks..."
+# تنظيف ملفات القفل لتجنب أخطاء إعادة التشغيل المفاجئ
+rm -f /tmp/.X99-lock
+rm -rf /tmp/runtime-node/*
+killall Xvfb pulseaudio 2>/dev/null || true
+
 echo "Starting Xvfb (Virtual Display)..."
 export DISPLAY=:99
 Xvfb :99 -screen 0 1280x720x24 &
