@@ -38,6 +38,9 @@ let grokPassthrough = null;
 let silenceInterval = null;   // ✅ keeps stream alive between FFmpeg chunks
 let isIdleBusy      = false;  // ✅ re-entrancy guard for Idle handler
 let sessionUserId   = null;
+let statusMessage   = null;   // live voice indicator message
+let statusChannel   = null;   // channel to post indicator in
+let silenceTimeout  = null;   // debounce for going back to silent
 
 // 20 ms of silence at 48kHz stereo 16-bit PCM  (960 frames × 2 ch × 2 bytes)
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
@@ -47,7 +50,24 @@ const commands = [
     { name: 'stop',  description: 'يوقف الجلسة ويحرر الموارد 🛑'  }
 ];
 
-// ─── دالة: بدء بث صوت Grok → Discord ─────────────────────────────────────
+// ─── دالة: تحديث مؤشر الصوت ────────────────────────────────────────────────
+async function updateVoiceStatus(speaking) {
+    if (!statusChannel) return;
+    const content = speaking
+        ? '🟢 **صوتك وصل** — البوت يسمعك الآن 🎤'
+        : '🔴 **لا يوجد صوت** — تحدث في القناة الصوتية 🔇';
+    try {
+        if (statusMessage) {
+            await statusMessage.edit(content);
+        } else {
+            statusMessage = await statusChannel.send(content);
+        }
+    } catch (e) {
+        console.error('❌ updateVoiceStatus:', e.message);
+    }
+}
+
+
 function startGrokAudio() {
     if (ffmpegOut) {
         ffmpegOut.stdout.unpipe();
@@ -174,7 +194,12 @@ function setupVoiceInput(receiver) {
     receiver.speaking.on('start', (userId) => {
         if (userId !== sessionUserId) return;
 
+        // clear any pending "went silent" timer
+        if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
+
         console.log('🎤 المستخدم يتكلم...');
+        updateVoiceStatus(true);
+
         if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
 
         const audioStream = receiver.subscribe(userId, {
@@ -203,6 +228,8 @@ function setupVoiceInput(receiver) {
         audioStream.on('end', () => {
             console.log('🎤 المستخدم توقف');
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+            // wait 800 ms before marking silent (avoids flicker on short pauses)
+            silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
         });
     });
 }
@@ -249,6 +276,8 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.reply('🔄 جاري التهيئة...');
         sessionUserId = interaction.user.id;
+        statusChannel = interaction.channel;
+        statusMessage = null;
 
         try {
             initPlayer();
@@ -329,6 +358,9 @@ client.on('interactionCreate', async (interaction) => {
                 '💬 اكتب أي نص ليُقرأ بصوت في القناة'
             );
 
+            // post the live voice indicator
+            await updateVoiceStatus(false);
+
         } catch (error) {
             console.error('❌ فشل التشغيل:', error);
             await interaction.editReply('❌ فشل: ' + error.message);
@@ -347,6 +379,7 @@ client.on('interactionCreate', async (interaction) => {
 
 // ─── دالة التنظيف الشامل ───────────────────────────────────────────────────
 function cleanupAll() {
+    if (silenceTimeout)  { clearTimeout(silenceTimeout); silenceTimeout = null; }
     if (silenceInterval)  { clearInterval(silenceInterval); silenceInterval = null; }
     if (ffmpegOut)        { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     if (ffmpegIn)         { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
@@ -356,6 +389,8 @@ function cleanupAll() {
     if (player)           { player.stop(); player = null; }
     isIdleBusy    = false;
     sessionUserId = null;
+    statusMessage = null;
+    statusChannel = null;
 }
 
 client.login(process.env.DISCORD_TOKEN);
