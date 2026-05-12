@@ -33,7 +33,7 @@ const client = new Client({
 
 let browser         = null;
 let page            = null;
-let cdpSession      = null;   // ✅ CDP session for deep permission control
+let cdpSession      = null;
 let ffmpegOut       = null;
 let ffmpegIn        = null;
 let connection      = null;
@@ -201,31 +201,8 @@ function setupVoiceInput(receiver) {
 async function activateGrokVoiceMode() {
     if (!page) return;
     console.log('🎙️ تفعيل وضع الصوت في Grok...');
-
     try {
-        // ✅ Step 1: Use CDP to grant microphone at the browser level
-        // This bypasses Chrome's permission UI entirely
-        cdpSession = await page.context().newCDPSession(page);
-
-        await cdpSession.send('Browser.grantPermissions', {
-            permissions: ['audioCapture', 'videoCapture'],
-            origin: 'https://grok.com'
-        });
-        console.log('✅ CDP: تم منح صلاحية الميكروفون عبر Browser.grantPermissions');
-
-        // ✅ Step 2: Intercept getUserMedia at JS level so it ALWAYS succeeds
-        await page.addInitScript(() => {
-            // Override permission query to always return 'granted'
-            const origQuery = window.navigator.permissions.query.bind(navigator.permissions);
-            navigator.permissions.query = (parameters) => {
-                if (parameters.name === 'microphone' || parameters.name === 'camera') {
-                    return Promise.resolve({ state: 'granted', onchange: null });
-                }
-                return origQuery(parameters);
-            };
-        });
-
-        // ✅ Step 3: Dismiss Connectors popup
+        // Dismiss Connectors popup if present
         try {
             await page.click('text=Dismiss', { timeout: 2000 });
             console.log('✅ أُغلقت نافذة Connectors');
@@ -233,8 +210,7 @@ async function activateGrokVoiceMode() {
 
         await page.waitForTimeout(800);
 
-        // ✅ Step 4: Click the voice/waveform button
-        // From the screenshot: it's the filled dark circle button (rightmost in input bar)
+        // Click the voice/waveform button
         const voiceClicked = await page.evaluate(() => {
             const allButtons = Array.from(document.querySelectorAll('button'));
 
@@ -247,35 +223,30 @@ async function activateGrokVoiceMode() {
                 }
             }
 
-            // Strategy 2: The dark filled circle button (last button in Grok's input form)
-            // In Grok's UI this is the waveform button — black rounded button on the right
+            // Strategy 2: Dark filled button in form (Grok's voice button)
             const form = document.querySelector('form');
             if (form) {
                 const btns = Array.from(form.querySelectorAll('button'));
-                // Find button with dark/filled background (the voice one)
                 for (const btn of btns) {
                     const style = window.getComputedStyle(btn);
                     const bg = style.backgroundColor;
-                    // Dark background = voice button
                     if (bg && (bg.includes('0, 0, 0') || bg.includes('rgb(0') || btn.classList.toString().includes('bg-'))) {
                         btn.click();
                         return `dark-bg-button: ${btn.className.substring(0, 50)}`;
                     }
                 }
-                // Fallback: last button in form
                 if (btns.length > 0) {
                     btns[btns.length - 1].click();
                     return `last-form-button (${btns.length} buttons found)`;
                 }
             }
 
-            // Strategy 3: Any button containing an SVG that looks like waveform/mic
+            // Strategy 3: SVG waveform button in bottom half of screen
             for (const btn of allButtons) {
                 const svgPaths = btn.querySelectorAll('svg path');
-                if (svgPaths.length >= 3) { // waveform has multiple paths
-                    // Check if it's in the input area
+                if (svgPaths.length >= 3) {
                     const rect = btn.getBoundingClientRect();
-                    if (rect.bottom > window.innerHeight * 0.6) { // bottom half of screen
+                    if (rect.bottom > window.innerHeight * 0.6) {
                         btn.click();
                         return `svg-waveform at y=${rect.bottom}`;
                     }
@@ -287,18 +258,11 @@ async function activateGrokVoiceMode() {
 
         console.log(`🎙️ نتيجة النقر على زر الصوت: ${voiceClicked}`);
 
-        // ✅ Step 5: Handle the mic permission dialog that Chrome might show
+        // Handle any JS dialogs
         page.on('dialog', async dialog => {
             console.log(`📢 Dialog: ${dialog.type()} — ${dialog.message()}`);
             await dialog.dismiss();
         });
-
-        // Watch for permission prompt via CDP and auto-accept
-        try {
-            cdpSession.on('Page.javascriptDialogOpening', async () => {
-                await cdpSession.send('Page.handleJavaScriptDialog', { accept: true });
-            });
-        } catch { /* ignore */ }
 
         await page.waitForTimeout(1000);
         console.log('✅ activateGrokVoiceMode مكتمل');
@@ -318,7 +282,7 @@ client.on('clientReady', async () => {
     } catch (err) { console.error('❌ خطأ في تسجيل الأوامر:', err); }
 });
 
-// ─── Text → Grok (not espeak) ─────────────────────────────────────────────────
+// ─── Text → Grok ──────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (message.author.id !== ALLOWED_USER_ID) {
@@ -371,8 +335,8 @@ client.on('interactionCreate', async (interaction) => {
             });
             connection.subscribe(player);
 
-            // ✅ Launch with fake-ui (suppresses Chrome's permission popup)
-            // but WITHOUT fake-device (so PulseAudio mic works for real)
+            // ✅ Launch WITHOUT --use-fake-ui-for-media-stream so real PulseAudio mic works
+            // ✅ Use --use-fake-device-for-media-stream to keep Chrome from complaining about no hardware
             browser = await chromium.launch({
                 headless: false,
                 args: [
@@ -380,13 +344,15 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
-                    '--use-fake-ui-for-media-stream',   // auto-accept mic dialog
+                    // ❌ REMOVED: '--use-fake-ui-for-media-stream' — this hijacks PulseAudio with a silent fake mic
+                    '--use-fake-device-for-media-stream', // keeps Chrome happy without blocking real audio
                     '--allow-file-access-from-files',
                     '--disable-web-security',
+                    '--disable-features=WebRtcHideLocalIpsWithMdns',
                 ]
             });
 
-            // ✅ Context with mic pre-granted
+            // ✅ Context with mic pre-granted at the browser context level
             const context = await browser.newContext({
                 permissions: ['microphone', 'camera'],
             });
@@ -421,9 +387,9 @@ client.on('interactionCreate', async (interaction) => {
 
             page = await context.newPage();
 
-            // ✅ Inject permission override BEFORE page loads
+            // ✅ Inject permission + getUserMedia overrides BEFORE page loads
             await page.addInitScript(() => {
-                // Make permissions.query always return 'granted' for mic
+                // 1. Make permissions.query always return 'granted' for mic/camera
                 const origQuery = navigator.permissions.query.bind(navigator.permissions);
                 navigator.permissions.query = (p) => {
                     if (p && (p.name === 'microphone' || p.name === 'camera')) {
@@ -431,23 +397,38 @@ client.on('interactionCreate', async (interaction) => {
                     }
                     return origQuery(p);
                 };
-                console.log('[BOT] Permission override injected');
+
+                // 2. Override getUserMedia to use PulseAudio VirtualMic (disable processing that interferes)
+                const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                navigator.mediaDevices.getUserMedia = (constraints) => {
+                    if (constraints && constraints.audio) {
+                        constraints.audio = {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                            // Don't restrict to a specific deviceId — let PulseAudio default source work
+                        };
+                    }
+                    return origGUM(constraints);
+                };
+
+                console.log('[BOT] Permission + getUserMedia overrides injected');
             });
 
-            await page.goto('https://grok.com', { waitUntil: 'networkidle' });
-            console.log('✅ Grok محمّل.');
-
-            // Grant via CDP after page is open
+            // ✅ Grant mic via CDP BEFORE navigating — this is the critical order fix
             try {
                 cdpSession = await context.newCDPSession(page);
                 await cdpSession.send('Browser.grantPermissions', {
-                    permissions: ['audioCapture'],
+                    permissions: ['audioCapture', 'videoCapture'],
                     origin: 'https://grok.com'
                 });
-                console.log('✅ CDP audioCapture granted');
+                console.log('✅ CDP: audioCapture + videoCapture granted BEFORE navigation');
             } catch (cdpErr) {
                 console.warn('⚠️ CDP grant failed (non-fatal):', cdpErr.message);
             }
+
+            await page.goto('https://grok.com', { waitUntil: 'networkidle' });
+            console.log('✅ Grok محمّل.');
 
             await activateGrokVoiceMode();
 
