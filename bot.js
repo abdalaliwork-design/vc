@@ -64,17 +64,32 @@ client.on('messageCreate', async (message) => {
 
             const context = await browser.newContext();
 
-            // 3. حقن الكوكيز الخاصة بتسجيل الدخول
-            if (fs.existsSync('./cookies.json')) {
-                const cookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
+            // 3. حقن الكوكيز الخاصة بتسجيل الدخول (من Railway Variables أو الملف)
+            let cookies = null;
+
+            if (process.env.GROK_COOKIES) {
+                try {
+                    cookies = JSON.parse(process.env.GROK_COOKIES);
+                    console.log('✅ تم جلب الكوكيز من متغيرات Railway بنجاح.');
+                } catch (err) {
+                    console.error('❌ خطأ في تحليل JSON الخاص بالكوكيز من المتغيرات!', err);
+                    message.channel.send('⚠️ خطأ في قراءة متغير GROK_COOKIES، تأكد من صحة الكود المنسوخ.');
+                }
+            } else if (fs.existsSync('./cookies.json')) {
+                cookies = JSON.parse(fs.readFileSync('./cookies.json', 'utf8'));
+                console.log('✅ تم جلب الكوكيز من ملف cookies.json المحلي.');
+            }
+
+            if (cookies) {
                 await context.addCookies(cookies);
             } else {
-                message.channel.send('⚠️ تنبيه: ملف cookies.json غير موجود. قد يُطلب تسجيل الدخول يدوياً.');
+                message.channel.send('⚠️ تنبيه: لم يتم العثور على كوكيز (لا في Railway ولا في الملف). قد يُطلب تسجيل الدخول يدوياً.');
             }
 
             // ضمان فتح Tab واحد فقط لتوفير استهلاك الرام (< 1GB)
             page = await context.newPage();
-            await page.goto('https://twitter.com/i/grok', { waitUntil: 'networkidle' });
+            // تم التعديل إلى رابط grok.com المباشر بناءً على الكوكيز الخاصة بك
+            await page.goto('https://grok.com', { waitUntil: 'networkidle' });
 
             // 4. تشغيل FFmpeg لسحب الصوت من الـ Monitor الخاص بـ DiscordSink
             // إعدادات مصممة خصيصاً لتقليل الـ Latency لأقل من ثانية
@@ -102,7 +117,7 @@ client.on('messageCreate', async (message) => {
             player.play(resource);
             connection.subscribe(player);
 
-            msg.edit('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل والصوت يتم بثه الآن إلى القناة.');
+            msg.edit('✅ **اكتمل الربط!** المتصفح في الخلفية يعمل (على grok.com) والصوت يتم بثه الآن إلى القناة.');
 
         } catch (error) {
             console.error(error);
@@ -143,5 +158,5 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// لا تنسَ إضافة DISCORD_TOKEN في إعدادات Railway (Variables)
+// تسجيل الدخول للبوت
 client.login(process.env.DISCORD_TOKEN);
