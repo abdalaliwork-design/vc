@@ -18,6 +18,9 @@ const prism = require('prism-media');
 
 chromium.use(stealth);
 
+// ─── ALLOWED USER ID ────────────────────────────────────────────────────────
+const ALLOWED_USER_ID = '712321588342816879';
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -35,15 +38,15 @@ let ffmpegIn        = null;
 let connection      = null;
 let player          = null;
 let grokPassthrough = null;
-let silenceInterval = null;   // ✅ keeps stream alive between FFmpeg chunks
-let isIdleBusy      = false;  // ✅ re-entrancy guard for Idle handler
-let voiceInputReady = false;  // ✅ module-level guard against double-init
+let silenceInterval = null;
+let isIdleBusy      = false;
+let voiceInputReady = false;
 let sessionUserId   = null;
-let statusMessage   = null;   // live voice indicator message
-let statusChannel   = null;   // channel to post indicator in
-let silenceTimeout  = null;   // debounce for going back to silent
+let statusMessage   = null;
+let statusChannel   = null;
+let silenceTimeout  = null;
 
-// 20 ms of silence at 48kHz stereo 16-bit PCM  (960 frames × 2 ch × 2 bytes)
+// 20 ms of silence at 48kHz stereo 16-bit PCM
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
 
 const commands = [
@@ -67,7 +70,6 @@ async function updateVoiceStatus(speaking) {
         console.error('❌ updateVoiceStatus:', e.message);
     }
 }
-
 
 function startGrokAudio() {
     if (ffmpegOut) {
@@ -118,7 +120,6 @@ function startGrokAudio() {
 function initPlayer() {
     grokPassthrough = new PassThrough({ highWaterMark: 96000 });
 
-    // ✅ pump silence every 20 ms so the stream never runs dry
     silenceInterval = setInterval(() => {
         if (grokPassthrough && !grokPassthrough.destroyed) {
             grokPassthrough.write(SILENCE_FRAME);
@@ -139,7 +140,6 @@ function initPlayer() {
         console.error('❌ Player error:', err.message);
     });
 
-    // ✅ Guard prevents the Idle → play → Idle crash loop
     player.on(AudioPlayerStatus.Idle, () => {
         if (isIdleBusy || !grokPassthrough || !connection) return;
         isIdleBusy = true;
@@ -154,12 +154,11 @@ function initPlayer() {
             console.error('❌ Failed to reattach resource:', e.message);
         }
 
-        // Release guard after one event-loop tick so rapid re-fires are swallowed
         setImmediate(() => { isIdleBusy = false; });
     });
 }
 
-// ─── دالة: TTS يكتب مباشرة لـ PulseAudio DiscordSink ─────────────────────
+// ─── دالة: TTS ─────────────────────────────────────────────────────────────
 function speakText(text) {
     return new Promise((resolve) => {
         const isArabic = /[\u0600-\u06FF]/.test(text);
@@ -168,7 +167,6 @@ function speakText(text) {
 
         console.log(`💬 TTS [${lang}]: ${text.substring(0, 60)}`);
 
-        // Step 1: espeak writes a complete WAV file (avoids pipe header corruption)
         const espeak = spawn('espeak', ['-v', lang, '-s', '150', '-w', tmpFile, text]);
 
         espeak.on('error', err => {
@@ -179,7 +177,6 @@ function speakText(text) {
         espeak.on('exit', (code) => {
             if (code !== 0) { console.error(`❌ espeak exited ${code}`); return resolve(); }
 
-            // Step 2: ffmpeg reads the complete file — no header issues
             const ffmpeg = spawn('ffmpeg', [
                 '-loglevel', 'error',
                 '-i', tmpFile,
@@ -202,8 +199,60 @@ function speakText(text) {
 
             ffmpeg.on('exit', () => {
                 console.log('✅ TTS انتهى');
-                fs.unlink(tmpFile, () => {}); // clean up temp file
+                fs.unlink(tmpFile, () => {});
                 resolve();
+            });
+        });
+    });
+}
+
+// ─── دالة: تحويل الصوت إلى نص (Whisper/STT) ────────────────────────────────
+function transcribeAudio(pcmBuffer) {
+    return new Promise((resolve) => {
+        const tmpPcm = `/tmp/stt_${Date.now()}.pcm`;
+        const tmpWav = `/tmp/stt_${Date.now()}.wav`;
+
+        fs.writeFile(tmpPcm, pcmBuffer, (err) => {
+            if (err) { console.error('❌ STT write error:', err.message); return resolve(null); }
+
+            // Convert raw PCM → WAV
+            const toWav = spawn('ffmpeg', [
+                '-loglevel', 'error',
+                '-f', 's16le', '-ar', '48000', '-ac', '2',
+                '-i', tmpPcm,
+                '-ar', '16000', '-ac', '1',
+                tmpWav
+            ]);
+
+            toWav.on('exit', (code) => {
+                fs.unlink(tmpPcm, () => {});
+                if (code !== 0) { return resolve(null); }
+
+                // Use whisper.cpp or whisper if available, otherwise log raw info
+                const whisper = spawn('whisper', [tmpWav, '--model', 'base', '--output_format', 'txt', '--output_dir', '/tmp'], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+                let output = '';
+                whisper.stdout.on('data', d => { output += d.toString(); });
+                whisper.stderr.on('data', d => { /* suppress */ });
+
+                whisper.on('error', () => {
+                    // whisper not installed — just log that audio was received
+                    fs.unlink(tmpWav, () => {});
+                    resolve(null);
+                });
+
+                whisper.on('exit', () => {
+                    fs.unlink(tmpWav, () => {});
+                    // Try reading txt output file
+                    const txtFile = tmpWav.replace('.wav', '.txt');
+                    if (fs.existsSync(txtFile)) {
+                        const text = fs.readFileSync(txtFile, 'utf8').trim();
+                        fs.unlink(txtFile, () => {});
+                        resolve(text || null);
+                    } else {
+                        resolve(output.trim() || null);
+                    }
+                });
             });
         });
     });
@@ -211,28 +260,39 @@ function speakText(text) {
 
 // ─── دالة: استقبال صوت المستخدم → Grok ────────────────────────────────────
 function setupVoiceInput(receiver) {
-    console.log('🎧 تهيئة استقبال صوت المستخدم...');
+    console.log(`🎧 تهيئة استقبال صوت المستخدم — ID المسموح: ${ALLOWED_USER_ID}`);
 
     function listenToUser() {
         if (!connection || !sessionUserId) return;
 
-        const audioStream = receiver.subscribe(sessionUserId, {
+        // ✅ Only listen to the ALLOWED user
+        if (sessionUserId !== ALLOWED_USER_ID) {
+            console.warn(`⛔ المستخدم ${sessionUserId} غير مصرح له — يجب أن يكون ${ALLOWED_USER_ID}`);
+            return;
+        }
+
+        const audioStream = receiver.subscribe(ALLOWED_USER_ID, {
             end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
         });
 
         let hasData = false;
+        const pcmChunks = [];
+
+        const opusDecoder = new prism.opus.Decoder({
+            rate: 48000, channels: 2, frameSize: 960
+        });
+
+        opusDecoder.on('data', (chunk) => {
+            pcmChunks.push(chunk);
+        });
 
         audioStream.on('data', () => {
             if (!hasData) {
                 hasData = true;
                 if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
-                console.log('🎤 المستخدم يتكلم...');
+                console.log(`\n🎤 [SPEAKING] المستخدم ${ALLOWED_USER_ID} يتكلم...`);
                 updateVoiceStatus(true);
             }
-        });
-
-        const opusDecoder = new prism.opus.Decoder({
-            rate: 48000, channels: 2, frameSize: 960
         });
 
         if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
@@ -252,13 +312,28 @@ function setupVoiceInput(receiver) {
 
         audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin);
 
-        audioStream.on('end', () => {
+        audioStream.on('end', async () => {
             if (hasData) {
-                console.log('🎤 المستخدم توقف');
+                console.log(`🎤 [STOPPED] المستخدم ${ALLOWED_USER_ID} توقف عن الكلام`);
+
+                // ─── Log transcription if Whisper available ───────────────
+                const pcmBuffer = Buffer.concat(pcmChunks);
+                console.log(`📊 [AUDIO] حجم البيانات الصوتية: ${(pcmBuffer.length / 1024).toFixed(1)} KB`);
+
+                transcribeAudio(pcmBuffer).then(text => {
+                    if (text) {
+                        console.log(`📝 [TRANSCRIPT] ما قاله المستخدم: "${text}"`);
+                        if (statusChannel) {
+                            statusChannel.send(`📝 سمعت: **${text}**`).catch(() => {});
+                        }
+                    } else {
+                        console.log(`📝 [TRANSCRIPT] (Whisper غير متوفر — لا يمكن تحويل الصوت إلى نص)`);
+                    }
+                });
+
                 silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
             }
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-            // Re-subscribe immediately to catch the next utterance
             setTimeout(() => listenToUser(), 100);
         });
 
@@ -274,6 +349,7 @@ function setupVoiceInput(receiver) {
 // ─── حدث: جاهزية البوت ─────────────────────────────────────────────────────
 client.on('clientReady', async () => {
     console.log(`✅ Logged in as ${client.user.tag}!`);
+    console.log(`🔒 البوت يقبل فقط من المستخدم: ${ALLOWED_USER_ID}`);
     try {
         await client.application.commands.set(commands);
         console.log('✅ تم تسجيل الأوامر!');
@@ -284,11 +360,20 @@ client.on('clientReady', async () => {
 
 // ─── حدث: رسائل النص → TTS ────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
-    if (message.author.bot)     return;
+    if (message.author.bot) return;
+
+    // ✅ Only respond to the allowed user's text messages
+    if (message.author.id !== ALLOWED_USER_ID) {
+        console.log(`⛔ [TEXT IGNORED] رسالة من ${message.author.tag} (${message.author.id}) — ليس المستخدم المصرح`);
+        return;
+    }
+
     if (!connection || !player) return;
 
     const text = message.content.trim();
     if (!text || text.startsWith('/')) return;
+
+    console.log(`💬 [TEXT] المستخدم ${ALLOWED_USER_ID} كتب: "${text}"`);
 
     try {
         await message.react('🔊');
@@ -304,6 +389,12 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    // ✅ Only allow the specific user to run commands
+    if (interaction.user.id !== ALLOWED_USER_ID) {
+        console.log(`⛔ [CMD BLOCKED] ${interaction.user.tag} (${interaction.user.id}) حاول تنفيذ /${interaction.commandName}`);
+        return interaction.reply({ content: '❌ ليس لديك صلاحية استخدام هذا البوت.', ephemeral: true });
+    }
+
     // ━━━ /start ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if (interaction.commandName === 'start') {
         const voiceChannel = interaction.member?.voice.channel;
@@ -312,9 +403,11 @@ client.on('interactionCreate', async (interaction) => {
         if (browser)       return interaction.reply({ content: '⚠️ جلسة تعمل بالفعل!', ephemeral: true });
 
         await interaction.reply('🔄 جاري التهيئة...');
-        sessionUserId = interaction.user.id;
+        sessionUserId = ALLOWED_USER_ID; // Always use the fixed allowed user ID
         statusChannel = interaction.channel;
         statusMessage = null;
+
+        console.log(`🚀 بدء الجلسة للمستخدم: ${ALLOWED_USER_ID}`);
 
         try {
             initPlayer();
@@ -337,8 +430,6 @@ client.on('interactionCreate', async (interaction) => {
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
                     '--use-fake-ui-for-media-stream',
-                    // NOTE: do NOT use --use-fake-device-for-media-stream
-                    // that replaces PulseAudio with a silent fake device
                 ]
             });
 
@@ -392,11 +483,9 @@ client.on('interactionCreate', async (interaction) => {
 
             connection.on(VoiceConnectionStatus.Ready, onReady);
 
-            // If already Ready before listener was attached, fire immediately
             if (connection.state.status === VoiceConnectionStatus.Ready) {
                 onReady();
             } else {
-                // Fallback: force-init after 5 s regardless
                 voiceReadyTimer = setTimeout(() => {
                     if (!voiceInputReady && connection) onReady(true);
                 }, 5000);
@@ -408,12 +497,12 @@ client.on('interactionCreate', async (interaction) => {
 
             await interaction.editReply(
                 '✅ **الجلسة تعمل!**\n' +
+                `🔒 يستمع فقط للمستخدم: <@${ALLOWED_USER_ID}>\n` +
                 '🔊 صوت Grok → Discord\n' +
                 '🎤 صوتك → Grok\n' +
                 '💬 اكتب أي نص ليُقرأ بصوت في القناة'
             );
 
-            // post the live voice indicator
             await updateVoiceStatus(false);
 
         } catch (error) {
@@ -435,18 +524,19 @@ client.on('interactionCreate', async (interaction) => {
 // ─── دالة التنظيف الشامل ───────────────────────────────────────────────────
 function cleanupAll() {
     if (silenceTimeout)  { clearTimeout(silenceTimeout); silenceTimeout = null; }
-    if (silenceInterval)  { clearInterval(silenceInterval); silenceInterval = null; }
+    if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
     voiceInputReady = false;
-    if (ffmpegOut)        { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
-    if (ffmpegIn)         { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-    if (grokPassthrough)  { grokPassthrough.destroy(); grokPassthrough = null; }
-    if (browser)          { browser.close().catch(() => {}); browser = null; page = null; }
-    if (connection)       { connection.destroy(); connection = null; }
-    if (player)           { player.stop(); player = null; }
+    if (ffmpegOut)       { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
+    if (ffmpegIn)        { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+    if (grokPassthrough) { grokPassthrough.destroy(); grokPassthrough = null; }
+    if (browser)         { browser.close().catch(() => {}); browser = null; page = null; }
+    if (connection)      { connection.destroy(); connection = null; }
+    if (player)          { player.stop(); player = null; }
     isIdleBusy    = false;
     sessionUserId = null;
     statusMessage = null;
     statusChannel = null;
+    console.log('🧹 تم تنظيف جميع الموارد');
 }
 
 client.login(process.env.DISCORD_TOKEN);
