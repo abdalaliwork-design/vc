@@ -6,7 +6,7 @@ killall Xvfb pulseaudio x11vnc websockify 2>/dev/null || true
 
 echo "Starting Xvfb (Virtual Display)..."
 export DISPLAY=:99
-Xvfb :99 -screen 0 1280x720x24 &
+Xvfb :99 -screen 0 1920x1080x24 &
 sleep 2
 
 echo "Starting PulseAudio..."
@@ -78,7 +78,7 @@ fi
 
 echo ""
 echo "═══════════════════════════════════════════"
-echo "  🖥️  noVNC:  http://YOUR_HOST:$NOVNC_PORT/vnc.html"
+echo "  🖥️  noVNC:  http://YOUR_HOST:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale&reconnect=true"
 echo "  🖥️  VNC:    vnc://YOUR_HOST:$VNC_PORT"
 echo "  🎤  VirtualMic source: DiscordMic.monitor → VirtualMic"
 echo "  🔊  Grok audio sink:   DiscordSink"
