@@ -1,19 +1,19 @@
 {
   "name": "grok-discord-voice-bridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
+  "description": "Grok ↔ Discord voice bridge via Playwright browser automation",
   "main": "bot.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "docker:build": "docker build -t grok-discord-bridge .",
+    "docker:run": "docker compose up"
   },
   "dependencies": {
-    "@discordjs/opus": "^0.9.0",
-    "@discordjs/voice": "^0.18.0",
     "discord.js": "^14.16.3",
     "playwright": "^1.47.2",
     "playwright-extra": "^4.3.6",
-    "prism-media": "^1.3.5",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
