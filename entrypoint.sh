@@ -71,14 +71,32 @@ pactl load-module module-virtual-source \
   source_properties=device.description="VirtualMicrophone" \
   rate=48000 channels=2 format=s16le
 
-# Route: Grok audio output → DiscordSink → pipe → DiscordMic → VirtualMic → Discord Web
+# Echo cancellation — removes YOUR voice from the mic feed
+# Problem without this: Discord Web plays everyone's audio (including yours)
+# through DiscordSink → loopback picks it up → sends it back as mic input → you hear yourself
+#
+# module-echo-cancel uses WebRTC AEC:
+#   sink_master   = DiscordSink   → playback reference signal (what to subtract)
+#   source_master = VirtualMic    → dirty mic signal (your voice leaks in here)
+#   result        = VirtualMicAEC → Grok's voice only, your echo cancelled out
+pactl load-module module-echo-cancel \
+  sink_name=EchoCancelSink \
+  sink_master=DiscordSink \
+  source_name=VirtualMicAEC \
+  source_master=VirtualMic \
+  source_properties=device.description="VirtualMicrophoneAEC" \
+  aec_method=webrtc \
+  rate=48000 channels=2
+
+# Route: Grok audio → DiscordSink → loopback → DiscordMic → VirtualMic → AEC → Discord Web
 echo "🔀 Setting up audio routing..."
 pactl set-default-sink   DiscordSink
-pactl set-default-source VirtualMic
+pactl set-default-source VirtualMicAEC
 
 export PULSE_SINK=DiscordSink
-export PULSE_SOURCE=VirtualMic
-export PULSE_LATENCY_MSEC=80
+export PULSE_SOURCE=VirtualMicAEC
+# ── Reduced from 80ms → 30ms to cut mic echo lag ─────────────────────────────
+export PULSE_LATENCY_MSEC=30
 
 echo ""
 echo "📡 Audio devices:"
@@ -88,12 +106,15 @@ echo ""
 
 # ── Start background audio loopback ──────────────────────────────────────────
 # This pipes DiscordSink.monitor → DiscordMic (creating the virtual cable)
+# --latency-msec=30 matches PULSE_LATENCY_MSEC above for tight sync
 echo "🔁 Starting audio loopback (DiscordSink → VirtualMic)..."
 pacat --record \
       --device=DiscordSink.monitor \
+      --latency-msec=30 \
       --format=s16le --rate=48000 --channels=2 | \
 pacat --playback \
       --device=DiscordMic \
+      --latency-msec=30 \
       --format=s16le --rate=48000 --channels=2 &
 LOOPBACK_PID=$!
 echo "✅ Audio loopback running (PID $LOOPBACK_PID)"
@@ -130,8 +151,8 @@ echo "════════════════════════�
 echo "  🖥️  noVNC  →  http://YOUR_HOST:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale"
 echo "  📺  VNC    →  vnc://YOUR_HOST:$VNC_PORT"
 echo ""
-echo "  🔊  Grok audio output  →  DiscordSink"
-echo "  🎤  Discord mic input  →  VirtualMic (via DiscordSink.monitor)"
+echo "  🔊  Grok audio output  →  DiscordSink (headless browser)"
+echo "  🎤  Discord mic input  →  VirtualMic (via DiscordSink.monitor, 30ms latency)"
 echo ""
 echo "  🤖  Persona : ${PERSONA_NAME:-Alex}"
 echo "  🔒  Access  : ${ALLOWED_USER_ID:-everyone}"
