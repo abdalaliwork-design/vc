@@ -322,47 +322,64 @@ async function openDiscordTab(ctx) {
 }
 
 async function loginToDiscordWeb(page) {
+  // Try 1: Token injection into localStorage (Discord has partially patched this,
+  // so we verify it actually worked before giving up on email/pass fallback)
   if (DISCORD_TOKEN) {
-    log('🔑', 'Injecting Discord token into localStorage...');
-    await page.evaluate(token => {
-      const iframe = document.createElement('iframe');
-      document.head.append(iframe);
-      const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
-      pd.get.call(iframe.contentWindow).setItem('token', `"${token}"`);
-      iframe.remove();
-    }, DISCORD_TOKEN);
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await sleep(4000);
-    return;
+    log('🔑', 'Trying Discord token injection...');
+    try {
+      await page.evaluate(token => {
+        try {
+          window.localStorage.setItem('token', `"${token}"`);
+        } catch (_) {
+          // Fallback: iframe trick
+          const iframe = document.createElement('iframe');
+          document.head.append(iframe);
+          const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
+          pd.get.call(iframe.contentWindow).setItem('token', `"${token}"`);
+          iframe.remove();
+        }
+      }, DISCORD_TOKEN);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await sleep(5000);
+
+      // Verify it actually logged in
+      if (!page.url().includes('login') && !page.url().includes('register')) {
+        log('✅', 'Discord token injection succeeded');
+        return;
+      }
+      log('⚠️', 'Token injection did not log in — falling through to email/password');
+    } catch (err) {
+      log('⚠️', 'Token injection error:', err.message, '— trying email/password');
+    }
   }
 
+  // Try 2: Email + password (most reliable)
   if (DISCORD_EMAIL && DISCORD_PASSWORD) {
     log('🔑', 'Logging in with email + password...');
     try {
-      // Make sure we're on the login page
       if (!page.url().includes('login')) {
         await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
         await sleep(2000);
       }
       await page.waitForSelector('input[name="email"]', { timeout: 15000 });
       await page.fill('input[name="email"]', DISCORD_EMAIL);
-      await sleep(300);
+      await sleep(400);
       await page.fill('input[name="password"]', DISCORD_PASSWORD);
-      await sleep(300);
+      await sleep(400);
       await page.click('button[type="submit"]');
-      await sleep(5000);
+      await sleep(6000);
 
       // Handle 2FA prompt if present
-      const twoFaInput = await page.$('input[name="code"], input[placeholder*="6-digit"]');
+      const twoFaInput = await page.$('input[name="code"], input[placeholder*="6-digit"], input[placeholder*="digit"]');
       if (twoFaInput) {
-        log('⚠️', 'Discord is asking for 2FA — cannot proceed automatically. Disable 2FA or use cookies.');
+        log('⚠️', '2FA required — cannot log in automatically. Disable 2FA on this account or log in manually via noVNC.');
         return;
       }
 
       if (!page.url().includes('login')) {
         log('✅', 'Discord email/password login succeeded');
       } else {
-        log('❌', 'Discord login failed — check your DISCORD_EMAIL / DISCORD_PASSWORD');
+        log('❌', 'Discord login failed — wrong credentials or rate-limited. Check DISCORD_EMAIL / DISCORD_PASSWORD');
       }
     } catch (err) {
       log('❌', 'Discord email login error:', err.message);
@@ -370,7 +387,7 @@ async function loginToDiscordWeb(page) {
     return;
   }
 
-  log('❌', 'No Discord auth available — set DISCORD_TOKEN, DISCORD_COOKIES, or DISCORD_EMAIL+DISCORD_PASSWORD');
+  log('❌', 'No Discord auth worked — set DISCORD_TOKEN, DISCORD_COOKIES, or DISCORD_EMAIL+DISCORD_PASSWORD');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
