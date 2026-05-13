@@ -202,8 +202,8 @@ function setupVoiceInput(receiver) {
             '-loglevel', 'warning',
             '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
             '-af', 'aresample=async=1000,aresample=48000',
-            '-f', 'pulse',
-            'DiscordMic',   // ✅ target the sink directly (not -device flag which is wrong)
+            '-f', 'pulse', '-device', 'DiscordMic',  // -device routes to the sink; the last arg is just the stream label
+            'discord_voice_in',
         ]);
         ffmpegIn.stderr.on('data', d => {
             const m = d.toString().trim();
