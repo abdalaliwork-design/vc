@@ -1,113 +1,142 @@
 #!/bin/bash
 set -e
 
-echo "Cleaning up old locks..."
-rm -f /tmp/.X99-lock
+echo "════════════════════════════════════════"
+echo "  Grok ↔ Discord Voice Bridge"
+echo "════════════════════════════════════════"
+
+# ── Clean stale locks ─────────────────────────────────────────────────────────
+echo "🧹 Cleaning up stale locks..."
+rm -f /tmp/.X99-lock /tmp/.X100-lock
 rm -rf /tmp/runtime-node/*
-killall Xvfb pulseaudio x11vnc websockify 2>/dev/null || true
+killall Xvfb pulseaudio x11vnc websockify chromium chromium-browser 2>/dev/null || true
 sleep 1
 
-echo "Starting Xvfb (Virtual Display)..."
+# ── Virtual Display ───────────────────────────────────────────────────────────
+echo "🖥️  Starting Xvfb (1920x1080)..."
 export DISPLAY=:99
-Xvfb :99 -screen 0 1920x1080x24 -ac &
-for i in $(seq 1 20); do
-    xdpyinfo -display :99 >/dev/null 2>&1 && break
-    sleep 0.3
+Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+XVFB_PID=$!
+
+for i in $(seq 1 30); do
+  xdpyinfo -display :99 >/dev/null 2>&1 && break
+  sleep 0.3
 done
-echo "✅ Xvfb ready"
+echo "✅ Xvfb ready (PID $XVFB_PID)"
 
-echo "Starting PulseAudio..."
-pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false
+# ── PulseAudio ────────────────────────────────────────────────────────────────
+echo "🔊 Starting PulseAudio..."
+pulseaudio --start \
+  --exit-idle-time=-1 \
+  --disallow-exit=1 \
+  --disallow-module-loading=0 \
+  --system=false \
+  --log-level=warn
 
-echo "Waiting for PulseAudio socket..."
-for i in $(seq 1 20); do
-    pactl info >/dev/null 2>&1 && break
-    sleep 0.3
+for i in $(seq 1 30); do
+  pactl info >/dev/null 2>&1 && break
+  sleep 0.3
 done
 
 if ! pactl info >/dev/null 2>&1; then
-    echo "⚠️ PulseAudio slow — retrying once..."
-    pulseaudio -D --exit-idle-time=-1 --disallow-exit=1 --system=false 2>/dev/null || true
-    sleep 3
+  echo "⚠️  PulseAudio slow, retrying..."
+  pulseaudio -D --exit-idle-time=-1 2>/dev/null || true
+  sleep 3
 fi
 
-if pactl info >/dev/null 2>&1; then
-    echo "✅ PulseAudio ready"
-else
-    echo "❌ PulseAudio failed to start!"
-    exit 1
-fi
+pactl info >/dev/null 2>&1 || { echo "❌ PulseAudio failed!"; exit 1; }
+echo "✅ PulseAudio ready"
 
-echo "Creating Virtual Audio Sink (DiscordSink)..."
+# ── Virtual Audio Cable Setup ─────────────────────────────────────────────────
+echo "🔌 Creating virtual audio devices..."
+
+# Sink 1: DiscordSink  → captures Grok's audio output
+#          Its .monitor is what we'll pipe TO Discord's microphone
 pactl load-module module-null-sink \
-    sink_name=DiscordSink \
-    sink_properties=device.description="DiscordSink" \
-    rate=48000 channels=2 format=s16le
+  sink_name=DiscordSink \
+  sink_properties=device.description="GrokAudioOutput" \
+  rate=48000 channels=2 format=s16le
 
-echo "Creating Virtual Mic Sink (DiscordMic)..."
+# Sink 2: DiscordMic  → acts as a virtual microphone for Discord Web
 pactl load-module module-null-sink \
-    sink_name=DiscordMic \
-    sink_properties=device.description="DiscordMic" \
-    rate=48000 channels=2 format=s16le
+  sink_name=DiscordMic \
+  sink_properties=device.description="DiscordMicInput" \
+  rate=48000 channels=2 format=s16le
 
-echo "Creating VirtualMic source from DiscordMic.monitor..."
+# Virtual source that reads from DiscordMic.monitor
+# → This is what the browser sees as "microphone"
 pactl load-module module-virtual-source \
-    source_name=VirtualMic \
-    master=DiscordMic.monitor \
-    source_properties=device.description="VirtualMic" \
-    rate=48000 channels=2 format=s16le
+  source_name=VirtualMic \
+  master=DiscordMic.monitor \
+  source_properties=device.description="VirtualMicrophone" \
+  rate=48000 channels=2 format=s16le
 
-echo "Setting PulseAudio defaults..."
-pactl set-default-sink DiscordSink
+# Route: Grok audio output → DiscordSink → pipe → DiscordMic → VirtualMic → Discord Web
+echo "🔀 Setting up audio routing..."
+pactl set-default-sink   DiscordSink
 pactl set-default-source VirtualMic
 
 export PULSE_SINK=DiscordSink
 export PULSE_SOURCE=VirtualMic
-export PULSE_LATENCY_MSEC=120
+export PULSE_LATENCY_MSEC=80
 
-echo "PulseAudio sources and sinks:"
-pactl list short sources
-pactl list short sinks
+echo ""
+echo "📡 Audio devices:"
+pactl list short sources | sed 's/^/   SOURCE  /'
+pactl list short sinks   | sed 's/^/   SINK    /'
+echo ""
 
-NOVNC_PORT=${NOVNC_PORT:-6080}
+# ── Start background audio loopback ──────────────────────────────────────────
+# This pipes DiscordSink.monitor → DiscordMic (creating the virtual cable)
+echo "🔁 Starting audio loopback (DiscordSink → VirtualMic)..."
+pacat --record \
+      --device=DiscordSink.monitor \
+      --format=s16le --rate=48000 --channels=2 | \
+pacat --playback \
+      --device=DiscordMic \
+      --format=s16le --rate=48000 --channels=2 &
+LOOPBACK_PID=$!
+echo "✅ Audio loopback running (PID $LOOPBACK_PID)"
+
+# ── VNC / noVNC ───────────────────────────────────────────────────────────────
 VNC_PORT=5900
+NOVNC_PORT=${NOVNC_PORT:-6080}
 
-echo "Starting x11vnc on port $VNC_PORT..."
+echo "📺 Starting x11vnc..."
 x11vnc -display :99 \
-    -nopw \
-    -forever \
-    -shared \
-    -rfbport $VNC_PORT \
-    -noxdamage \
-    -quiet \
-    -bg 2>/dev/null
+  -nopw -forever -shared \
+  -rfbport $VNC_PORT \
+  -noxdamage -quiet -bg 2>/dev/null
 sleep 1
 
-echo "Starting noVNC on port $NOVNC_PORT..."
+echo "🌐 Starting noVNC on port $NOVNC_PORT..."
 if [ -d "/opt/novnc" ]; then
-    websockify --web /opt/novnc/utils/novnc_proxy --wrap-mode=ignore $NOVNC_PORT localhost:$VNC_PORT &
-    echo "✅ noVNC ready → http://localhost:$NOVNC_PORT/vnc.html"
+  websockify --web /opt/novnc \
+    --wrap-mode=ignore \
+    $NOVNC_PORT localhost:$VNC_PORT &
 elif command -v websockify >/dev/null 2>&1; then
-    NOVNC_SHARE=$(find /usr -name "vnc.html" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
-    if [ -n "$NOVNC_SHARE" ]; then
-        websockify --web "$NOVNC_SHARE" $NOVNC_PORT localhost:$VNC_PORT &
-        echo "✅ noVNC ready → http://localhost:$NOVNC_PORT/vnc.html"
-    else
-        websockify $NOVNC_PORT localhost:$VNC_PORT &
-        echo "✅ websockify VNC proxy on port $NOVNC_PORT"
-    fi
+  NOVNC_SHARE=$(find /usr /opt -name "vnc.html" 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+  if [ -n "$NOVNC_SHARE" ]; then
+    websockify --web "$NOVNC_SHARE" $NOVNC_PORT localhost:$VNC_PORT &
+  else
+    websockify $NOVNC_PORT localhost:$VNC_PORT &
+  fi
 else
-    echo "⚠️ noVNC/websockify not installed — VNC only on port $VNC_PORT"
+  echo "⚠️  websockify not found — VNC only"
 fi
 
 echo ""
-echo "═══════════════════════════════════════════"
-echo "  🖥️  noVNC:  http://YOUR_HOST:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale&reconnect=true"
-echo "  🖥️  VNC:    vnc://YOUR_HOST:$VNC_PORT"
-echo "  🎤  VirtualMic source: DiscordMic.monitor → VirtualMic"
-echo "  🔊  Grok audio sink:   DiscordSink"
-echo "═══════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════"
+echo "  🖥️  noVNC  →  http://YOUR_HOST:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale"
+echo "  📺  VNC    →  vnc://YOUR_HOST:$VNC_PORT"
+echo ""
+echo "  🔊  Grok audio output  →  DiscordSink"
+echo "  🎤  Discord mic input  →  VirtualMic (via DiscordSink.monitor)"
+echo ""
+echo "  🤖  Persona : ${PERSONA_NAME:-Alex}"
+echo "  🔒  Access  : ${ALLOWED_USER_ID:-everyone}"
+echo "════════════════════════════════════════════════════════"
 echo ""
 
-echo "Starting Node.js Bot..."
+echo "🚀 Starting Node.js bot..."
 exec node bot.js
