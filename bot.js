@@ -1,3 +1,8 @@
+process.env.DISCORDJS_NO_LAZY_LOAD = 'true';
+
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const { Client, GatewayIntentBits } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -21,9 +26,9 @@ const prism = require('prism-media');
 
 chromium.use(stealth);
 
-const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID || '712321588342816879';
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GROK_URL = process.env.GROK_URL || 'https://grok.com';
+const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID || null;
 
 if (!DISCORD_TOKEN) {
   console.error('❌ DISCORD_TOKEN is missing');
@@ -36,6 +41,7 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -56,7 +62,6 @@ let inputKeepAliveInterval = null;
 
 let isIdleBusy = false;
 let voiceInputReady = false;
-let sessionUserId = null;
 let statusMessage = null;
 let statusChannel = null;
 let silenceTimeout = null;
@@ -65,6 +70,8 @@ let currentDecoder = null;
 let activeAudioStream = null;
 let isUserSpeaking = false;
 let speakingEndTimer = null;
+let currentSpeakerId = null;
+let currentGuild = null;
 
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
 
@@ -84,6 +91,13 @@ function safeKill(proc, signal = 'SIGKILL') {
   } catch {}
 }
 
+function getSpeakerLabel(userId) {
+  const member = currentGuild?.members?.cache?.get(userId);
+  if (member) return member.displayName || member.user?.username || userId;
+  const user = client.users.cache.get(userId);
+  return user?.username || userId;
+}
+
 async function postVoiceChat(text) {
   if (!statusChannel) return;
   try {
@@ -96,7 +110,7 @@ async function postVoiceChat(text) {
 async function updateVoiceStatus(speaking) {
   if (!statusChannel) return;
   const content = speaking
-    ? '🟢 **صوتك وصل** — البوت يسمعك الآن 🎤'
+    ? '🟢 **صوت مسموع** — البوت يسمع الآن 🎤'
     : '🔴 **لا يوجد صوت** — تحدث في القناة الصوتية 🔇';
   try {
     if (statusMessage) {
@@ -111,6 +125,7 @@ async function updateVoiceStatus(speaking) {
 
 function cleanupInputStream() {
   isUserSpeaking = false;
+  currentSpeakerId = null;
 
   if (speakingEndTimer) {
     clearTimeout(speakingEndTimer);
@@ -324,18 +339,20 @@ async function sendTextToGrok(text) {
   }
 }
 
-function startUserAudioCapture(receiver) {
+function startUserAudioCapture(receiver, userId) {
   if (activeAudioStream || currentDecoder) return;
 
   ensureInputPipeline();
   isUserSpeaking = true;
+  currentSpeakerId = userId;
 
   if (speakingEndTimer) {
     clearTimeout(speakingEndTimer);
     speakingEndTimer = null;
   }
 
-  postVoiceChat(`🎤 <@${ALLOWED_USER_ID}> user talk`);
+  const label = getSpeakerLabel(userId);
+  postVoiceChat(`🎤 **${label}** user talk`);
   updateVoiceStatus(true);
 
   currentDecoder = new prism.opus.Decoder({
@@ -348,7 +365,7 @@ function startUserAudioCapture(receiver) {
     console.error('❌ OpusDecoder:', err.message);
   });
 
-  activeAudioStream = receiver.subscribe(ALLOWED_USER_ID, {
+  activeAudioStream = receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
   });
 
@@ -359,8 +376,10 @@ function startUserAudioCapture(receiver) {
   });
 
   activeAudioStream.on('end', async () => {
+    const endedUserId = currentSpeakerId;
     cleanupInputStream();
-    await postVoiceChat(`🔇 <@${ALLOWED_USER_ID}> user stopped`);
+    const endedLabel = getSpeakerLabel(endedUserId || userId);
+    await postVoiceChat(`🔇 **${endedLabel}** user stopped`);
     await updateVoiceStatus(false);
   });
 
@@ -368,10 +387,12 @@ function startUserAudioCapture(receiver) {
 }
 
 function setupVoiceInput(receiver) {
-  console.log(`🎧 إعداد استقبال الصوت لـ: ${ALLOWED_USER_ID}`);
+  console.log('🎧 إعداد استقبال الصوت لجميع المستخدمين في القناة...');
 
   receiver.speaking.on('start', (userId) => {
-    if (userId !== ALLOWED_USER_ID) return;
+    if (currentSpeakerId && currentSpeakerId !== userId) {
+      return;
+    }
 
     if (silenceTimeout) {
       clearTimeout(silenceTimeout);
@@ -380,19 +401,21 @@ function setupVoiceInput(receiver) {
 
     if (isUserSpeaking || activeAudioStream) return;
 
-    console.log('🎤 [SPEAKING] المستخدم يتكلم...');
-    startUserAudioCapture(receiver);
+    console.log(`🎤 [SPEAKING] user ${userId} started`);
+    startUserAudioCapture(receiver, userId);
   });
 
   receiver.speaking.on('end', (userId) => {
-    if (userId !== ALLOWED_USER_ID) return;
-    console.log('🎤 [STOPPED] انتهى الصوت');
+    if (!currentSpeakerId || currentSpeakerId !== userId) return;
+
+    console.log(`🎤 [STOPPED] user ${userId} stopped`);
 
     if (speakingEndTimer) clearTimeout(speakingEndTimer);
     speakingEndTimer = setTimeout(async () => {
       if (!isUserSpeaking) return;
       isUserSpeaking = false;
-      await postVoiceChat(`🔇 <@${ALLOWED_USER_ID}> user stopped`);
+      const label = getSpeakerLabel(userId);
+      await postVoiceChat(`🔇 **${label}** user stopped`);
       await updateVoiceStatus(false);
     }, 500);
   });
@@ -603,7 +626,7 @@ async function startGrokBrowser() {
       '--use-fake-ui-for-media-stream',
       '--allow-file-access-from-files',
       '--disable-web-security',
-      '--disable-features=WebRtcHideLocalIpsWithMdns',
+      '--disable-features=WebRtcHideLocalIpsWithMdns,AudioServiceOutOfProcess',
       '--enable-features=PulseAudio',
     ],
   });
@@ -678,9 +701,9 @@ async function startGrokBrowser() {
   }
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}!`);
-  console.log(`🔒 Allowed user: ${ALLOWED_USER_ID}`);
+  console.log(`🔒 Allowed user restriction: ${ALLOWED_USER_ID || 'none (everyone can speak)'}`);
 
   try {
     await client.application.commands.set(commands);
@@ -692,11 +715,14 @@ client.once('ready', async () => {
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  if (message.author.id !== ALLOWED_USER_ID) return;
   if (!page) return;
 
   const text = message.content.trim();
   if (!text || text.startsWith('/')) return;
+
+  if (ALLOWED_USER_ID && message.author.id !== ALLOWED_USER_ID) {
+    return;
+  }
 
   console.log(`💬 [TEXT→GROK] "${text}"`);
 
@@ -714,7 +740,7 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.user.id !== ALLOWED_USER_ID) {
+  if (ALLOWED_USER_ID && interaction.user.id !== ALLOWED_USER_ID) {
     return interaction.reply({ content: '❌ ليس لديك صلاحية.', ephemeral: true });
   }
 
@@ -728,9 +754,9 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     await interaction.reply('🔄 جاري التهيئة...');
-    sessionUserId = ALLOWED_USER_ID;
     statusChannel = interaction.channel;
     statusMessage = null;
+    currentGuild = interaction.guild;
 
     try {
       initPlayer();
@@ -743,43 +769,21 @@ client.on('interactionCreate', async (interaction) => {
         selfMute: false,
       });
 
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`🔄 Voice State: ${oldState.status} -> ${newState.status}`);
+      });
+
+      connection.on('error', (err) => {
+        console.error('❌ Voice connection error:', err);
+      });
+
+      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+      console.log('✅ Voice connection READY');
+
       connection.subscribe(player);
 
       await startGrokBrowser();
       ensureOutputPipeline();
-
-      await new Promise((resolve) => {
-        const state = connection.state.status;
-        console.log(`🔗 Voice connection state: ${state}`);
-
-        if (state === VoiceConnectionStatus.Ready) {
-          return resolve();
-        }
-
-        if (
-          state === VoiceConnectionStatus.Destroyed ||
-          state === VoiceConnectionStatus.Disconnected
-        ) {
-          return resolve();
-        }
-
-        const timer = setTimeout(() => {
-          console.warn(`⚠️ تهيئة إجبارية — الحالة: ${connection.state.status}`);
-          resolve();
-        }, 10000);
-
-        connection.once(VoiceConnectionStatus.Ready, () => {
-          clearTimeout(timer);
-          console.log('✅ الاتصال الصوتي جاهز!');
-          resolve();
-        });
-
-        connection.once(VoiceConnectionStatus.Disconnected, () => {
-          clearTimeout(timer);
-          console.warn('⚠️ انقطع الاتصال أثناء الانتظار');
-          resolve();
-        });
-      });
 
       if (!voiceInputReady && connection.state.status !== VoiceConnectionStatus.Destroyed) {
         voiceInputReady = true;
@@ -808,9 +812,8 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply(
         '✅ **الجلسة تعمل!**\n' +
-        `🔒 للمستخدم <@${ALLOWED_USER_ID}> فقط\n` +
-        '🔊 صوت Grok → Discord\n' +
-        '🎤 صوتك → Grok\n' +
+        `🔊 صوت Grok → Discord\n` +
+        `🎤 صوت القناة → Grok\n` +
         '💬 اكتب هنا → يُرسل لـ Grok (يرد بصوته)\n' +
         '🖥️ noVNC لمشاهدة الشاشة'
       );
@@ -857,6 +860,7 @@ function cleanupAll() {
   voiceInputReady = false;
   isSendingToGrok = false;
   isUserSpeaking = false;
+  currentSpeakerId = null;
 
   cleanupInputStream();
 
@@ -912,9 +916,9 @@ function cleanupAll() {
   }
 
   isIdleBusy = false;
-  sessionUserId = null;
   statusMessage = null;
   statusChannel = null;
+  currentGuild = null;
 
   console.log('🧹 تم تنظيف جميع الموارد');
 }
