@@ -234,6 +234,18 @@ async function launchBrowser() {
       '--autoplay-policy=no-user-gesture-required',
       '--disable-web-security',
       '--window-size=1920,1080', '--start-maximized',
+      // ── Memory / crash reduction ──────────────────────────────────────────
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-background-networking',
+      '--disable-extensions',
+      '--disable-sync',
+      '--disable-translate',
+      '--disable-default-apps',
+      '--no-first-run',
+      '--disable-hang-monitor',
+      '--renderer-process-limit=4',
+      '--js-flags=--max-old-space-size=512',
     ],
     executablePath: process.env.CHROMIUM_PATH || undefined,
   });
@@ -293,39 +305,24 @@ async function openDiscordTab(ctx) {
   discordPage = await ctx.newPage();
   discordPage.on('dialog', d => d.dismiss().catch(() => {}));
 
-  // ── Method 1: MILO_TOKEN — navigate to discord.com first to establish origin, then inject ──
+  // ── Method 1: MILO_TOKEN — inject directly into localStorage (best, bypasses login page) ──
   if (MILO_TOKEN) {
     log('🔑', 'Injecting Milo user token into Discord localStorage...');
-    try {
-      // Step 1: land on discord.com to get the right origin (localStorage requires it)
-      await discordPage.goto('https://discord.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(1500);
+    // addInitScript runs BEFORE any page JS, on every navigation in this page
+    await discordPage.addInitScript(token => {
+      try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (_) {}
+    }, MILO_TOKEN);
+    // Go straight to /app — the init script sets the token before Discord's code runs
+    await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(4000);
 
-      // Step 2: now we're on the right origin — write the token
-      await discordPage.evaluate(token => {
-        window.localStorage.setItem('token', JSON.stringify(token));
-      }, MILO_TOKEN);
-
-      // Step 3: also register the initScript so it survives reloads / crashes
-      await discordPage.addInitScript(token => {
-        try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (_) {}
-      }, MILO_TOKEN);
-
-      // Step 4: navigate to /app — Discord picks up the token immediately
-      await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await sleep(4000);
-
-      if (!discordPage.url().includes('login')) {
-        log('✅', 'Discord logged in via MILO_TOKEN');
-        await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
-        log('✅', 'Discord Web tab ready (Milo is online)');
-        attachDiscordCrashHandler();
-        return;
-      }
-      log('⚠️', 'MILO_TOKEN injection did not work — token may be expired');
-    } catch (err) {
-      log('⚠️', 'MILO_TOKEN injection error:', err.message);
+    if (!discordPage.url().includes('login')) {
+      log('✅', 'Discord logged in via MILO_TOKEN');
+      await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
+      log('✅', 'Discord Web tab ready (Milo is online)');
+      return;
     }
+    log('⚠️', 'MILO_TOKEN injection did not work — token may be expired');
   }
 
   // ── Method 2: Saved browser profile session (persists after first manual login) ──
@@ -336,7 +333,6 @@ async function openDiscordTab(ctx) {
     log('✅', 'Discord logged in via saved browser session');
     await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
     log('✅', 'Discord Web tab ready (Milo is online)');
-    attachDiscordCrashHandler();
     return;
   }
 
@@ -394,7 +390,6 @@ async function openDiscordTab(ctx) {
 
   if (appReady) {
     log('✅', 'Discord Web tab ready (Milo is online)');
-    attachDiscordCrashHandler();
   } else {
     log('❌', 'Discord login failed — bot will run without Discord browser tab');
   }
@@ -470,113 +465,32 @@ async function loginToDiscordWeb(page) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DISCORD PAGE CRASH RECOVERY
-// ─────────────────────────────────────────────────────────────────────────────
-function attachDiscordCrashHandler() {
-  if (!discordPage) return;
-  discordPage.on('crash', async () => {
-    log('💥', 'Discord page crashed (Aw Snap / error code 9) — auto-recovering...');
-    await recoverDiscordPage();
-  });
-}
-
-async function recoverDiscordPage() {
-  log('🔄', 'Recovering Discord page...');
-
-  // Try a simple reload first (fastest)
-  try {
-    if (discordPage && !discordPage.isClosed()) {
-      await discordPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(3000);
-      if (discordPage.url().includes('discord.com') && !discordPage.url().includes('login')) {
-        log('✅', 'Discord page recovered via reload');
-        attachDiscordCrashHandler();
-        return true;
-      }
-    }
-  } catch (_) {}
-
-  // Reload failed — open a fresh tab
-  log('🔁', 'Reload failed — opening a fresh Discord tab...');
-  try {
-    if (discordPage && !discordPage.isClosed()) discordPage.close().catch(() => {});
-    discordPage = null;
-    if (browserCtx) {
-      await openDiscordTab(browserCtx);
-      return !!discordPage;
-    }
-  } catch (err) {
-    log('❌', 'Discord page recovery failed:', err.message);
-  }
-  return false;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  VOICE CHANNEL — navigate browser to a specific guild+channel
 // ─────────────────────────────────────────────────────────────────────────────
 async function joinVoiceChannelById(guildId, channelId) {
   if (!discordPage) { log('❌', 'Discord tab not open'); return false; }
-
   log('🔊', `Navigating to channel ${channelId} in guild ${guildId}`);
-
-  // Helper: perform the actual navigation + click
-  async function doJoin() {
-    // If the page shows a crash/error, reload it first
-    const pageUrl = discordPage.url();
-    const isCrashPage = pageUrl === 'chrome-error://chromewebdata/'
-      || pageUrl.startsWith('chrome-error://')
-      || pageUrl === 'about:blank';
-
-    if (isCrashPage) {
-      log('🔄', 'Discord page is on error/blank screen — recovering before joining...');
-      const ok = await recoverDiscordPage();
-      if (!ok) throw new Error('Discord page recovery failed, cannot join VC');
-      await sleep(2000);
-    }
-
+  try {
     await discordPage.goto(
       `https://discord.com/channels/${guildId}/${channelId}`,
       { waitUntil: 'domcontentloaded', timeout: 30000 }
     );
     await sleep(2000);
 
-    // Click "Join Voice" button if the prompt appears
+    // Click "Join Voice" if the prompt appears
     const joinBtn = discordPage.locator('button:has-text("Join Voice"), button:has-text("Join")');
     if (await joinBtn.count() > 0) {
       await joinBtn.first().click();
       await sleep(1500);
     }
 
-    // Grant mic permission if prompted
+    // Grant mic permission if asked
     const allowBtn = discordPage.locator('button:has-text("Allow"), button:has-text("Grant Access")');
     if (await allowBtn.count() > 0) await allowBtn.first().click();
 
     log('✅', `Milo joined voice channel ${channelId}`);
     return true;
-  }
-
-  try {
-    return await doJoin();
   } catch (err) {
-    const isCrash = err.message.includes('crashed')
-      || err.message.includes('Page crashed')
-      || err.message.includes('Target crashed')
-      || err.message.includes('Session closed');
-
-    if (isCrash) {
-      log('💥', 'Discord page crashed during voice join — recovering and retrying once...');
-      const recovered = await recoverDiscordPage();
-      if (recovered) {
-        await sleep(3000);
-        try {
-          return await doJoin();
-        } catch (err2) {
-          log('❌', 'Voice join failed after recovery:', err2.message);
-          return false;
-        }
-      }
-    }
-
     log('❌', 'joinVoiceChannelById error:', err.message);
     return false;
   }
