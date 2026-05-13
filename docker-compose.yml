@@ -11,8 +11,10 @@ services:
     ipc: host
     privileged: false
 
-    # Shared memory for Chromium
-    shm_size: "2gb"
+    # Shared memory for Chromium + WebRTC voice
+    # Bumped from 2gb → 4gb: Discord voice + two browser tabs need the headroom.
+    # DO NOT add --disable-dev-shm-usage in bot.js — that would negate this.
+    shm_size: "4gb"
 
     ports:
       - "6080:6080"   # noVNC web UI
@@ -27,19 +29,36 @@ services:
       DISCORD_EMAIL: "${DISCORD_EMAIL}"
       DISCORD_PASSWORD: "${DISCORD_PASSWORD}"
 
+      # ── Milo's browser account ────────────────────────────────
+      # The user token of the SECOND Discord account (Milo).
+      # Get it from a logged-in browser console (see bot.js logs for instructions).
+      # If set, Milo skips the login page entirely on every restart.
+      MILO_TOKEN: "${MILO_TOKEN}"
+
+      # Milo's Discord account ID (the browser session account, not the bot)
+      MILO_ACCOUNT_ID: "${MILO_ACCOUNT_ID:-1504162446196080754}"
+
+      # Your Discord user ID — only you can trigger Milo
+      OWNER_ID: "${OWNER_ID:-712321588342816879}"
+
       # ── X.com / Grok ─────────────────────────────────────────
       X_USERNAME: "${X_USERNAME}"
       X_PASSWORD: "${X_PASSWORD}"
+
+      # Exported cookies from x.com (JSON array format from Cookie-Editor extension)
+      # Required for Grok voice tab. Without this, Grok tab is skipped.
+      GROK_COOKIES: "${GROK_COOKIES}"
 
       # ── DeepSeek (persona text chat) ─────────────────────────
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
 
       # ── Persona ───────────────────────────────────────────────
-      PERSONA_NAME: "${PERSONA_NAME:-Alex}"
-      PERSONA_PERSONALITY: "${PERSONA_PERSONALITY:-a chill friend who knows everything}"
+      PERSONA_NAME: "${PERSONA_NAME:-Milo}"
+      PERSONA_PERSONALITY: "${PERSONA_PERSONALITY:-a chill friend who knows everything — witty, warm, never robotic}"
 
       # ── Permissions ───────────────────────────────────────────
-      ALLOWED_USER_ID: "${ALLOWED_USER_ID:-}"   # Leave blank = everyone
+      # Leave blank = everyone can see bot responses (but only OWNER_ID can trigger it)
+      ALLOWED_USER_ID: "${ALLOWED_USER_ID:-}"
 
       # ── Channel names (for browser-only mode) ─────────────────
       VOICE_CHANNEL_NAME: "${VOICE_CHANNEL_NAME:-General}"
@@ -50,6 +69,10 @@ services:
       # ── Display ───────────────────────────────────────────────
       DISPLAY: ":99"
       NOVNC_PORT: "6080"
+
+      # ── Chromium binary override (optional) ───────────────────
+      # Only needed if you install a custom Chromium path in your Dockerfile.
+      # CHROMIUM_PATH: "/usr/bin/chromium"
 
     volumes:
       # Persist browser profiles (stay logged in across restarts)
