@@ -15,6 +15,7 @@ const DISCORD_TOKEN    = process.env.DISCORD_TOKEN    || null;
 const DISCORD_EMAIL    = process.env.DISCORD_EMAIL    || null;
 const DISCORD_PASSWORD = process.env.DISCORD_PASSWORD || null;
 const DISCORD_COOKIES  = process.env.DISCORD_COOKIES  || null;
+const MILO_TOKEN       = process.env.MILO_TOKEN       || null; // Milo's user token (bypasses login page)
 const GROK_COOKIES     = process.env.GROK_COOKIES     || null;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || null;
 const GROK_URL         = 'https://grok.com';
@@ -292,32 +293,94 @@ async function openDiscordTab(ctx) {
   discordPage = await ctx.newPage();
   discordPage.on('dialog', d => d.dismiss().catch(() => {}));
 
-  if (DISCORD_COOKIES) {
-    const cookies = parseCookies(DISCORD_COOKIES, '.discord.com');
-    if (cookies.length) {
-      await ctx.addCookies(cookies);
-      log('🍪', `Injected ${cookies.length} Discord cookies`);
+  // ── Method 1: MILO_TOKEN — inject directly into localStorage (best, bypasses login page) ──
+  if (MILO_TOKEN) {
+    log('🔑', 'Injecting Milo user token into Discord localStorage...');
+    // Go to discord.com (not /login) so we're on the right origin
+    await discordPage.goto('https://discord.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await discordPage.evaluate(token => {
+      localStorage.setItem('token', `"${token}"`);
+    }, MILO_TOKEN);
+    // Now navigate to /app — Discord reads the token and loads without a login page
+    await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(4000);
+
+    if (!discordPage.url().includes('login')) {
+      log('✅', 'Discord logged in via MILO_TOKEN');
+      await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
+      log('✅', 'Discord Web tab ready (Milo is online)');
+      return;
     }
+    log('⚠️', 'MILO_TOKEN injection did not work — token may be expired');
   }
 
+  // ── Method 2: Saved browser profile session (persists after first manual login) ──
   await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(4000);
 
-  if (discordPage.url().includes('login') || discordPage.url().includes('register')) {
-    log('🔑', 'Cookie auth failed — trying fallback auth...');
-    await loginToDiscordWeb(discordPage);
+  if (!discordPage.url().includes('login') && !discordPage.url().includes('register')) {
+    log('✅', 'Discord logged in via saved browser session');
+    await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
+    log('✅', 'Discord Web tab ready (Milo is online)');
+    return;
   }
 
-  // Wait for the Discord app shell to appear
+  // ── Method 3: Email + password (may hit Cloudflare on fresh IPs) ──
+  if (DISCORD_EMAIL && DISCORD_PASSWORD) {
+    log('🔑', 'Trying email/password login...');
+    await loginToDiscordWeb(discordPage);
+    await sleep(4000);
+    if (!discordPage.url().includes('login')) {
+      log('✅', 'Discord Web tab ready (Milo is online)');
+      return;
+    }
+  }
+
+  // ── Method 4: Manual login via noVNC — wait up to 5 minutes ──
+  log('⚠️', '══════════════════════════════════════════════════════════════');
+  log('⚠️', ' Discord login blocked (Cloudflare). Two options:');
+  log('⚠️', '');
+  log('⚠️', ' OPTION A (permanent fix):');
+  log('⚠️', '   Get Milo\'s token from a logged-in browser console:');
+  log('⚠️', '   (webpackChunkdiscord_app.push([[\'\'  ],{},e=>{m=[];for(let c in e.c)m.push(e.c[c])}]),m)');
+  log('⚠️', '   .find(m=>m?.exports?.default?.getToken!==void 0).exports.default.getToken()');
+  log('⚠️', '   Then add it to Railway as: MILO_TOKEN=<token>');
+  log('⚠️', '');
+  log('⚠️', ' OPTION B (one-time manual):');
+  log('⚠️', '   Open noVNC and use the QR code to log in with your phone:');
+  log('⚠️', '   http://YOUR_HOST:6080/vnc.html?autoconnect=true&resize=scale');
+  log('⚠️', '   Waiting 5 minutes...');
+  log('⚠️', '══════════════════════════════════════════════════════════════');
+
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await sleep(5000);
+    if (!discordPage.url().includes('login') && !discordPage.url().includes('register')) {
+      log('✅', 'Manual Discord login detected!');
+      // Save token to persistent localStorage for next restart
+      try {
+        const savedToken = await discordPage.evaluate(() => {
+          return (webpackChunkdiscord_app
+            ?.flatMap(c => Object.values(c[1] || {}))
+            ?.find(m => m?.exports?.default?.getToken)
+            ?.exports?.default?.getToken()) || null;
+        });
+        if (savedToken) log('💾', `Add this to Railway as MILO_TOKEN to skip manual login next time:\n  ${savedToken}`);
+      } catch (_) {}
+      break;
+    }
+    const remaining = Math.round((deadline - Date.now()) / 1000);
+    if (remaining % 30 === 0) log('⏳', `Still waiting for manual Discord login... ${remaining}s left`);
+  }
+
   const appReady = await discordPage.waitForSelector(
-    '[class*="sidebar"], [class*="guilds"], [class*="app-"]',
-    { timeout: 40000 }
+    '[class*="sidebar"], [class*="guilds"]', { timeout: 10000 }
   ).catch(() => null);
 
   if (appReady) {
     log('✅', 'Discord Web tab ready (Milo is online)');
   } else {
-    log('⚠️', 'Discord Web tab loaded but app shell not detected — may still work');
+    log('❌', 'Discord login failed — bot will run without Discord browser tab');
   }
 }
 
