@@ -65,6 +65,7 @@ ENV DISPLAY=:99
 ENV PULSE_SINK=DiscordSink
 ENV PULSE_SOURCE=VirtualMic
 ENV PULSE_LATENCY_MSEC=120
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
 
 USER node
 ENTRYPOINT ["./entrypoint.sh"]
