@@ -19,15 +19,10 @@ const MILO_TOKEN       = process.env.MILO_TOKEN       || null;
 const GROK_COOKIES     = process.env.GROK_COOKIES     || null;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || null;
 const GROK_URL         = 'https://grok.com';
-
-// Chromium path override — set CHROMIUM_PATH in env if you want a specific binary
 const CHROMIUM_PATH    = process.env.CHROMIUM_PATH    || undefined;
 
-// Milo's real Discord account ID (the browser session account)
-const MILO_ACCOUNT_ID = process.env.MILO_ACCOUNT_ID || '1504162446196080754';
-
-// Only this user (you) can tag Milo and trigger responses
-const OWNER_ID = process.env.OWNER_ID || '712321588342816879';
+const MILO_ACCOUNT_ID  = process.env.MILO_ACCOUNT_ID  || '1504162446196080754';
+const OWNER_ID         = process.env.OWNER_ID         || '712321588342816879';
 
 const PERSONA = {
   name:        process.env.PERSONA_NAME        || 'Milo',
@@ -52,29 +47,54 @@ if (!hasDiscordAuth) {
   console.error('❌  Need at least one Discord auth: DISCORD_TOKEN | DISCORD_COOKIES | DISCORD_EMAIL+DISCORD_PASSWORD');
   process.exit(1);
 }
-if (!hasGrokAuth)      console.warn('⚠️  GROK_COOKIES not set — Grok voice will be skipped');
+if (!hasGrokAuth)      console.warn('⚠️  GROK_COOKIES not set — Grok voice will be unavailable');
 if (!DEEPSEEK_API_KEY) console.warn('⚠️  DEEPSEEK_API_KEY not set — text replies disabled');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STATE
 // ─────────────────────────────────────────────────────────────────────────────
-let browser     = null;
-let browserCtx  = null;
-let grokPage    = null;
-let discordPage = null;
-let isBusy      = false;
+let browser       = null;
+let browserCtx    = null;
+let grokPage      = null;   // LAZY — only opened on /ask, auto-closes after idle
+let discordPage   = null;
+let isBusy        = false;
+let grokIdleTimer = null;
 const conversationHistory = new Map();
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function log(emoji, ...args) { console.log(new Date().toISOString(), emoji, ...args); }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  RESOURCE BLOCKING
+//  Blocks images, media, fonts, and tracking scripts on all pages.
+//  Discord and Grok work fine without them. Saves ~200-400MB per tab.
+// ─────────────────────────────────────────────────────────────────────────────
+const BLOCKED_TYPES = new Set(['image', 'media', 'font', 'ping']);
+const BLOCKED_HOSTS = [
+  'analytics', 'telemetry', 'tracking', 'metrics',
+  'doubleclick', 'googlesyndication', 'adservice',
+  'sentry.io', 'datadoghq', 'newrelic', 'fullstory',
+  'hotjar', 'segment.io', 'mixpanel', 'amplitude',
+  'clarity.ms', 'mouseflow', 'logrocket',
+];
+
+async function blockHeavyResources(page) {
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    const url  = route.request().url();
+    if (BLOCKED_TYPES.has(type)) return route.abort();
+    if (BLOCKED_HOSTS.some(h => url.includes(h))) return route.abort();
+    route.continue();
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  TAG HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 function isMiloTagged(content) {
   return (
-    content.includes(`<@${MILO_ACCOUNT_ID}>`)   ||
-    content.includes(`<@!${MILO_ACCOUNT_ID}>`)  ||
+    content.includes(`<@${MILO_ACCOUNT_ID}>`)  ||
+    content.includes(`<@!${MILO_ACCOUNT_ID}>`) ||
     content.toLowerCase().includes(`@${PERSONA.name.toLowerCase()}`)
   );
 }
@@ -118,16 +138,14 @@ function normalizeSameSite(value) {
 function parseCookies(raw, domain) {
   if (!raw) return [];
   raw = raw.trim();
-
   if (raw.startsWith('[')) {
     try {
       const arr = JSON.parse(raw);
       return arr.map(c => {
-        const cookieDomain = c.domain || domain;
         const cookie = {
           name:     c.name,
           value:    c.value,
-          domain:   cookieDomain,
+          domain:   c.domain || domain,
           path:     c.path     || '/',
           secure:   c.secure   !== undefined ? c.secure   : true,
           httpOnly: c.httpOnly !== undefined ? c.httpOnly : false,
@@ -141,19 +159,11 @@ function parseCookies(raw, domain) {
       log('⚠️', 'Cookie JSON parse failed, trying raw string...');
     }
   }
-
   return raw.split(';').map(s => {
     const eq = s.indexOf('=');
     if (eq < 0) return null;
-    return {
-      name:     s.slice(0, eq).trim(),
-      value:    s.slice(eq + 1).trim(),
-      domain:   domain,
-      path:     '/',
-      secure:   true,
-      httpOnly: false,
-      sameSite: 'None',
-    };
+    return { name: s.slice(0, eq).trim(), value: s.slice(eq + 1).trim(),
+             domain, path: '/', secure: true, httpOnly: false, sameSite: 'None' };
   }).filter(Boolean);
 }
 
@@ -175,10 +185,7 @@ You're in Discord. Keep it short (1-3 sentences), never sound like a bot.`;
   try {
     const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` },
       body: JSON.stringify({
         model: 'deepseek-chat',
         messages: [{ role: 'system', content: system }, ...history],
@@ -186,10 +193,7 @@ You're in Discord. Keep it short (1-3 sentences), never sound like a bot.`;
         frequency_penalty: 0.4, presence_penalty: 0.4,
       }),
     });
-    if (!res.ok) {
-      console.error('❌ DeepSeek', res.status, await res.text());
-      return "brain.exe crashed 😅";
-    }
+    if (!res.ok) { console.error('❌ DeepSeek', res.status, await res.text()); return "brain.exe crashed 😅"; }
     const data  = await res.json();
     const reply = data.choices[0].message.content;
     history.push({ role: 'assistant', content: reply });
@@ -206,7 +210,7 @@ function resetConversation(channelId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BROWSER LAUNCH  ← ALL FIXES ARE HERE
+//  BROWSER LAUNCH
 // ─────────────────────────────────────────────────────────────────────────────
 async function launchBrowser() {
   if (browser) {
@@ -222,37 +226,41 @@ async function launchBrowser() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
 
-      // ── DO NOT add --disable-dev-shm-usage ────────────────────────────────
-      // Discord voice + WebRTC needs shared memory. We set shm_size in compose.
+      // ── DO NOT add --disable-dev-shm-usage ───────────────────────────────
+      // shm_size=4gb is set in docker-compose. Discord voice needs shared mem.
 
       '--disable-blink-features=AutomationControlled',
 
-      // ── WebRTC / media — required for voice to work ───────────────────────
-      '--use-fake-ui-for-media-stream',
-      '--autoplay-policy=no-user-gesture-required',
-      '--disable-web-security',
-      '--enable-usermedia-screen-capturing',
-      '--allow-http-screen-capture',
-      '--auto-select-desktop-capture-source=Entire screen',
-
-      // ── GPU: use swiftshader (software GL) ───────────────────────────────
-      // DO NOT use --disable-gpu or --disable-software-rasterizer together.
-      // Either one alone breaks WebRTC's media pipeline → Aw, Snap!
-      // swiftshader gives software rendering that WebRTC still accepts.
+      // ── GPU: swiftshader (software GL that WebRTC still accepts) ──────────
+      // DO NOT use --disable-gpu + --disable-software-rasterizer together —
+      // that kills WebRTC's media pipeline and causes the Aw Snap crash.
       '--disable-gpu-sandbox',
       '--use-gl=swiftshader',
       '--ignore-gpu-blocklist',
 
-      // ── Memory — Discord JS bundle + voice needs headroom ─────────────────
-      '--js-flags=--max-old-space-size=2048',   // was 512 → OOM crash
-      // DO NOT set --renderer-process-limit — default is fine
+      // ── Media ─────────────────────────────────────────────────────────────
+      // DO NOT add --use-fake-ui-for-media-stream:
+      //   it replaces your PulseAudio VirtualMic with a silent fake device,
+      //   causing Discord Error 3002. Mic permissions are granted via context.
+      '--autoplay-policy=no-user-gesture-required',
+      '--disable-web-security',
+      '--enable-usermedia-screen-capturing',
+      '--allow-http-screen-capture',
 
-      // ── Stability / noise reduction (safe to keep) ────────────────────────
+      // ── Memory ────────────────────────────────────────────────────────────
+      '--js-flags=--max-old-space-size=2048',
+      '--memory-pressure-off',
+      '--disable-component-update',
+
+      // ── Reduce unnecessary processes ──────────────────────────────────────
       '--disable-background-networking',
       '--disable-extensions',
       '--disable-sync',
       '--disable-translate',
       '--disable-default-apps',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-ipc-flooding-protection',
       '--no-first-run',
       '--disable-hang-monitor',
 
@@ -264,11 +272,11 @@ async function launchBrowser() {
 
   browserCtx = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
-    // clipboard-read added so Discord clipboard paste doesn't throw permission errors
+    // Grant mic/camera at context level — no dialog popup.
+    // The actual audio device used will be PulseAudio's default (VirtualMic)
+    // because we did NOT use --use-fake-ui-for-media-stream.
     permissions: ['microphone', 'camera', 'notifications', 'clipboard-read'],
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
@@ -288,18 +296,34 @@ async function launchBrowser() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GROK TAB
+//  GROK TAB — LAZY
+//  Not opened on startup. Only opens when /ask is used.
+//  Auto-closes after 5 minutes idle to free memory for Discord voice.
 // ─────────────────────────────────────────────────────────────────────────────
-async function openGrokTab(ctx) {
-  log('🤖', 'Opening Grok tab...');
+const GROK_IDLE_MS = 5 * 60 * 1000;
+
+async function ensureGrokTab() {
+  if (!hasGrokAuth) { log('⚠️', 'No GROK_COOKIES — cannot open Grok'); return false; }
+
+  // Check if existing page is still alive
+  if (grokPage) {
+    try { await grokPage.title(); }
+    catch (_) { grokPage = null; }
+  }
+
+  if (grokPage) { rescheduleGrokIdle(); return true; }
+
+  const ctx = await launchBrowser();
+  log('🤖', 'Opening Grok tab (lazy)...');
   grokPage = await ctx.newPage();
   grokPage.on('dialog', d => d.dismiss().catch(() => {}));
-
-  // Catch renderer crashes and log them instead of silently dying
   grokPage.on('crash', () => {
-    log('💥', 'Grok page crashed (renderer). Will retry on next command.');
+    log('💥', 'Grok page crashed — will re-open on next /ask');
     grokPage = null;
+    if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
   });
+
+  await blockHeavyResources(grokPage);
 
   const cookies = parseCookies(GROK_COOKIES, '.x.com');
   if (cookies.length) {
@@ -314,54 +338,75 @@ async function openGrokTab(ctx) {
   if (isLoggedIn) {
     log('✅', 'Grok tab ready');
     await activateGrokVoice();
+    rescheduleGrokIdle();
+    return true;
   } else {
-    log('⚠️', 'Grok login failed — check your GROK_COOKIES');
+    log('⚠️', 'Grok login failed — check GROK_COOKIES');
+    await grokPage.close().catch(() => {});
+    grokPage = null;
+    return false;
   }
+}
+
+function rescheduleGrokIdle() {
+  if (grokIdleTimer) clearTimeout(grokIdleTimer);
+  grokIdleTimer = setTimeout(() => {
+    log('💤', 'Closing Grok tab after inactivity (freeing memory for Discord voice)');
+    if (grokPage) { grokPage.close().catch(() => {}); grokPage = null; }
+    grokIdleTimer = null;
+  }, GROK_IDLE_MS);
+}
+
+function closeGrokTab() {
+  if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
+  if (grokPage) { grokPage.close().catch(() => {}); grokPage = null; }
+  log('🗑️', 'Grok tab closed');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DISCORD TAB
 // ─────────────────────────────────────────────────────────────────────────────
 async function openDiscordTab(ctx) {
-  log('💬', 'Opening Discord Web tab (Milo account)...');
+  log('💬', 'Opening Discord tab (Milo account)...');
   discordPage = await ctx.newPage();
   discordPage.on('dialog', d => d.dismiss().catch(() => {}));
 
-  // Catch renderer crashes gracefully
+  // Block images/media/fonts — Discord renders fine without them, saves ~200MB
+  await blockHeavyResources(discordPage);
+
   discordPage.on('crash', () => {
-    log('💥', 'Discord page crashed (renderer). Attempting recovery...');
+    log('💥', 'Discord page crashed — recovering in 5s...');
     discordPage = null;
-    setTimeout(() => {
-      launchBrowser().then(c => openDiscordTab(c)).catch(err => log('❌', 'Recovery failed:', err.message));
+    setTimeout(async () => {
+      const c = await launchBrowser().catch(() => null);
+      if (c) openDiscordTab(c).catch(err => log('❌', 'Recovery failed:', err.message));
     }, 5000);
   });
 
   // ── Method 1: MILO_TOKEN ──────────────────────────────────────────────────
   if (MILO_TOKEN) {
-    log('🔑', 'Injecting Milo user token into Discord localStorage...');
+    log('🔑', 'Injecting Milo user token...');
     await discordPage.addInitScript(token => {
       try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (_) {}
     }, MILO_TOKEN);
     await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await sleep(4000);
-
     if (!discordPage.url().includes('login')) {
       log('✅', 'Discord logged in via MILO_TOKEN');
       await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
-      log('✅', 'Discord Web tab ready (Milo is online)');
+      log('✅', 'Discord tab ready (Milo is online)');
       return;
     }
-    log('⚠️', 'MILO_TOKEN injection did not work — token may be expired');
+    log('⚠️', 'MILO_TOKEN may be expired — trying saved session');
   }
 
   // ── Method 2: Saved browser session ──────────────────────────────────────
   await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(4000);
-
   if (!discordPage.url().includes('login') && !discordPage.url().includes('register')) {
-    log('✅', 'Discord logged in via saved browser session');
+    log('✅', 'Discord logged in via saved session');
     await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 20000 }).catch(() => {});
-    log('✅', 'Discord Web tab ready (Milo is online)');
+    log('✅', 'Discord tab ready (Milo is online)');
     return;
   }
 
@@ -371,26 +416,19 @@ async function openDiscordTab(ctx) {
     await loginToDiscordWeb(discordPage);
     await sleep(4000);
     if (!discordPage.url().includes('login')) {
-      log('✅', 'Discord Web tab ready (Milo is online)');
+      log('✅', 'Discord tab ready (Milo is online)');
       return;
     }
   }
 
   // ── Method 4: Manual login via noVNC ─────────────────────────────────────
-  log('⚠️', '══════════════════════════════════════════════════════════════');
-  log('⚠️', ' Discord login blocked (Cloudflare). Two options:');
-  log('⚠️', '');
-  log('⚠️', ' OPTION A (permanent fix):');
-  log('⚠️', '   Get Milo\'s token from a logged-in browser console:');
+  log('⚠️', '════════════════════════════════════════════════════════');
+  log('⚠️', ' OPTION A — Get Milo\'s token from a logged-in browser:');
   log('⚠️', '   (webpackChunkdiscord_app.push([[\'\'  ],{},e=>{m=[];for(let c in e.c)m.push(e.c[c])}]),m)');
   log('⚠️', '   .find(m=>m?.exports?.default?.getToken!==void 0).exports.default.getToken()');
-  log('⚠️', '   Then add it to Railway as: MILO_TOKEN=<token>');
-  log('⚠️', '');
-  log('⚠️', ' OPTION B (one-time manual):');
-  log('⚠️', '   Open noVNC and use the QR code to log in with your phone:');
-  log('⚠️', '   http://YOUR_HOST:6080/vnc.html?autoconnect=true&resize=scale');
-  log('⚠️', '   Waiting 5 minutes...');
-  log('⚠️', '══════════════════════════════════════════════════════════════');
+  log('⚠️', '   Add as MILO_TOKEN env var.');
+  log('⚠️', ' OPTION B — Log in manually via noVNC, waiting 5 minutes...');
+  log('⚠️', '════════════════════════════════════════════════════════');
 
   const deadline = Date.now() + 5 * 60 * 1000;
   while (Date.now() < deadline) {
@@ -404,23 +442,20 @@ async function openDiscordTab(ctx) {
             ?.find(m => m?.exports?.default?.getToken)
             ?.exports?.default?.getToken()) || null;
         });
-        if (savedToken) log('💾', `Add this to Railway as MILO_TOKEN to skip manual login next time:\n  ${savedToken}`);
+        if (savedToken) log('💾', `Save this as MILO_TOKEN:\n  ${savedToken}`);
       } catch (_) {}
       break;
     }
     const remaining = Math.round((deadline - Date.now()) / 1000);
-    if (remaining % 30 === 0) log('⏳', `Still waiting for manual Discord login... ${remaining}s left`);
+    if (remaining % 30 === 0) log('⏳', `Waiting for manual login... ${remaining}s left`);
   }
 
   const appReady = await discordPage.waitForSelector(
     '[class*="sidebar"], [class*="guilds"]', { timeout: 10000 }
   ).catch(() => null);
 
-  if (appReady) {
-    log('✅', 'Discord Web tab ready (Milo is online)');
-  } else {
-    log('❌', 'Discord login failed — bot will run without Discord browser tab');
-  }
+  if (appReady) log('✅', 'Discord tab ready (Milo is online)');
+  else log('❌', 'Discord login failed — running without browser tab');
 }
 
 async function loginToDiscordWeb(page) {
@@ -428,9 +463,8 @@ async function loginToDiscordWeb(page) {
     log('🔑', 'Trying Discord token injection...');
     try {
       await page.evaluate(token => {
-        try {
-          window.localStorage.setItem('token', `"${token}"`);
-        } catch (_) {
+        try { window.localStorage.setItem('token', `"${token}"`); }
+        catch (_) {
           const iframe = document.createElement('iframe');
           document.head.append(iframe);
           const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
@@ -440,24 +474,19 @@ async function loginToDiscordWeb(page) {
       }, DISCORD_TOKEN);
       await page.reload({ waitUntil: 'domcontentloaded' });
       await sleep(5000);
-
       if (!page.url().includes('login') && !page.url().includes('register')) {
-        log('✅', 'Discord token injection succeeded');
-        return;
+        log('✅', 'Discord token injection succeeded'); return;
       }
-      log('⚠️', 'Token injection did not log in — falling through to email/password');
-    } catch (err) {
-      log('⚠️', 'Token injection error:', err.message, '— trying email/password');
-    }
+      log('⚠️', 'Token injection failed — trying email/password');
+    } catch (err) { log('⚠️', 'Token injection error:', err.message); }
   }
 
   if (DISCORD_EMAIL && DISCORD_PASSWORD) {
     log('🔑', 'Logging in with email + password...');
     try {
-      if (!page.url().includes('login')) {
+      if (!page.url().includes('login'))
         await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await sleep(2000);
-      }
+      await sleep(2000);
       await page.waitForSelector('input[name="email"]', { timeout: 15000 });
       await page.fill('input[name="email"]', DISCORD_EMAIL);
       await sleep(400);
@@ -465,50 +494,122 @@ async function loginToDiscordWeb(page) {
       await sleep(400);
       await page.click('button[type="submit"]');
       await sleep(6000);
-
-      const twoFaInput = await page.$('input[name="code"], input[placeholder*="6-digit"], input[placeholder*="digit"]');
-      if (twoFaInput) {
-        log('⚠️', '2FA required — cannot log in automatically. Disable 2FA on this account or log in manually via noVNC.');
-        return;
-      }
-
-      if (!page.url().includes('login')) {
-        log('✅', 'Discord email/password login succeeded');
-      } else {
-        log('❌', 'Discord login failed — wrong credentials or rate-limited. Check DISCORD_EMAIL / DISCORD_PASSWORD');
-      }
-    } catch (err) {
-      log('❌', 'Discord email login error:', err.message);
-    }
+      const twoFaInput = await page.$('input[name="code"], input[placeholder*="6-digit"]');
+      if (twoFaInput) { log('⚠️', '2FA required — disable 2FA or log in manually via noVNC'); return; }
+      if (!page.url().includes('login')) log('✅', 'Email/password login succeeded');
+      else log('❌', 'Login failed — wrong credentials or rate-limited');
+    } catch (err) { log('❌', 'Email login error:', err.message); }
     return;
   }
 
-  log('❌', 'No Discord auth worked — set DISCORD_TOKEN, DISCORD_COOKIES, or DISCORD_EMAIL+DISCORD_PASSWORD');
+  log('❌', 'No Discord auth method worked');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  VOICE CHANNEL
+//  DISCORD MIC SETTINGS FIX
+//  Opens Discord User Settings → Voice & Video and sets Input Device to Default.
+//  "Default" maps to VirtualMic via PulseAudio (we set it as default source).
+//  Called automatically 4 seconds after joining a voice channel.
+// ─────────────────────────────────────────────────────────────────────────────
+async function fixDiscordMicSettings() {
+  if (!discordPage) return;
+  log('🎤', 'Fixing Discord mic settings...');
+  try {
+    // Open User Settings
+    const gearBtn = discordPage.locator('[aria-label="User Settings"]').first();
+    if (await gearBtn.count() === 0) {
+      log('⚠️', 'Settings gear not found — skipping mic fix'); return;
+    }
+    await gearBtn.click();
+    await sleep(1500);
+
+    // Click Voice & Video in the settings sidebar
+    const voiceNav = discordPage.locator('[class*="item"]:has-text("Voice & Video")').first();
+    if (await voiceNav.count() === 0) {
+      await discordPage.keyboard.press('Escape');
+      log('⚠️', 'Voice & Video setting not found — skipping mic fix'); return;
+    }
+    await voiceNav.click();
+    await sleep(1000);
+
+    // Set Input Device to Default (maps to VirtualMic via PulseAudio default source)
+    const inputWrapper = discordPage.locator(
+      '[class*="deviceSelectWrapper"], [class*="inputDevice"], [class*="inputDevices"]'
+    ).first();
+    if (await inputWrapper.count() > 0) {
+      await inputWrapper.click();
+      await sleep(500);
+      const defaultOpt = discordPage.locator('[class*="option"]:has-text("Default")').first();
+      if (await defaultOpt.count() > 0) {
+        await defaultOpt.click();
+        log('✅', 'Mic input set to Default (→ VirtualMic via PulseAudio)');
+      }
+    } else {
+      log('⚠️', 'Input device dropdown not found — Discord may auto-select VirtualMic');
+    }
+
+    await discordPage.keyboard.press('Escape');
+    await sleep(500);
+  } catch (err) {
+    log('⚠️', 'fixDiscordMicSettings (non-fatal):', err.message);
+    try { await discordPage.keyboard.press('Escape'); } catch (_) {}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  VOICE CHANNEL JOIN
 // ─────────────────────────────────────────────────────────────────────────────
 async function joinVoiceChannelById(guildId, channelId) {
   if (!discordPage) { log('❌', 'Discord tab not open'); return false; }
-  log('🔊', `Navigating to channel ${channelId} in guild ${guildId}`);
+  log('🔊', `Joining VC ${channelId} in guild ${guildId}`);
   try {
-    await discordPage.goto(
-      `https://discord.com/channels/${guildId}/${channelId}`,
-      { waitUntil: 'domcontentloaded', timeout: 30000 }
-    );
-    await sleep(2000);
-
-    const joinBtn = discordPage.locator('button:has-text("Join Voice"), button:has-text("Join")');
-    if (await joinBtn.count() > 0) {
-      await joinBtn.first().click();
-      await sleep(1500);
+    // Step 1: Navigate to guild first if we're not already there (lighter than jumping to channel directly)
+    const currentUrl = discordPage.url();
+    if (!currentUrl.includes(guildId)) {
+      await discordPage.goto(
+        `https://discord.com/channels/${guildId}`,
+        { waitUntil: 'domcontentloaded', timeout: 30000 }
+      );
+      await sleep(2000);
     }
 
-    const allowBtn = discordPage.locator('button:has-text("Allow"), button:has-text("Grant Access")');
-    if (await allowBtn.count() > 0) await allowBtn.first().click();
+    // Step 2: Try clicking the VC link in the sidebar (less aggressive than full page navigation)
+    const vcLink = discordPage.locator(
+      `a[href*="/${channelId}"], [data-list-item-id*="${channelId}"]`
+    ).first();
 
-    log('✅', `Milo joined voice channel ${channelId}`);
+    if (await vcLink.count() > 0) {
+      log('🖱️', 'Clicking VC in sidebar...');
+      await vcLink.click();
+      await sleep(2000);
+    } else {
+      // Fallback: direct navigation
+      log('🔗', 'VC not in sidebar — navigating directly...');
+      await discordPage.goto(
+        `https://discord.com/channels/${guildId}/${channelId}`,
+        { waitUntil: 'domcontentloaded', timeout: 30000 }
+      );
+      await sleep(2000);
+    }
+
+    // Step 3: Click "Join Voice" if the button appears
+    const joinBtn = discordPage.locator(
+      'button:has-text("Join Voice"), button:has-text("Join")'
+    ).first();
+    if (await joinBtn.count() > 0) {
+      await joinBtn.click();
+      await sleep(2000);
+    }
+
+    // Step 4: Allow mic if browser shows a prompt
+    const allowBtn = discordPage.locator('button:has-text("Allow"), button:has-text("Grant Access")').first();
+    if (await allowBtn.count() > 0) await allowBtn.click();
+
+    log('✅', `Milo joined VC ${channelId}`);
+
+    // Step 5: Fix mic settings after Discord loads voice
+    setTimeout(() => fixDiscordMicSettings().catch(() => {}), 4000);
+
     return true;
   } catch (err) {
     log('❌', 'joinVoiceChannelById error:', err.message);
@@ -550,13 +651,16 @@ async function activateGrokVoice() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEND TO GROK
+//  SEND TO GROK (opens tab lazily if needed)
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendToGrok(text) {
-  if (!grokPage || isBusy) return false;
+  if (isBusy) return false;
   isBusy = true;
   log('📨', `Sending to Grok: "${text}"`);
   try {
+    const ready = await ensureGrokTab();
+    if (!ready) { log('❌', 'Grok tab unavailable'); return false; }
+
     const selectors = [
       'textarea[placeholder]',
       'div[contenteditable="true"]',
@@ -570,12 +674,14 @@ async function sendToGrok(text) {
       input = null;
     }
     if (!input) { log('❌', 'Grok input not found'); return false; }
+
     await input.click();
     await sleep(200);
     await grokPage.keyboard.press('Control+a');
     await grokPage.keyboard.type(text, { delay: 25 });
     await grokPage.keyboard.press('Enter');
     log('✅', 'Sent to Grok');
+    rescheduleGrokIdle();
     await sleep(2000);
     return true;
   } catch (err) {
@@ -587,21 +693,21 @@ async function sendToGrok(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AUTO-START
+//  AUTO-START  (Discord tab only — Grok tab is lazy)
 // ─────────────────────────────────────────────────────────────────────────────
 async function autoStart() {
   log('🚀', 'Auto-starting browser session...');
   try {
     const ctx = await launchBrowser();
 
-    if (hasGrokAuth) await openGrokTab(ctx);
-    else log('⚠️', 'Skipping Grok tab (no GROK_COOKIES)');
-
+    // Only Discord tab on startup — Grok opens on first /ask.
+    // This keeps memory free for Discord voice/WebRTC.
     await openDiscordTab(ctx);
 
     log('🎉', '══════════════════════════════════════════════');
     log('🎉', `  ${PERSONA.name} is LIVE!`);
     log('🎉', '  Tag @Milo in chat or join a VC and she follows');
+    log('🎉', '  Grok tab is lazy — opens on first /ask, closes after 5min idle');
     log('🎉', '  noVNC → http://YOUR_HOST:6080/vnc.html?autoconnect=true&resize=scale');
     log('🎉', '══════════════════════════════════════════════');
   } catch (err) {
@@ -632,11 +738,12 @@ async function startDiscordBot() {
   });
 
   const commands = [
-    { name: 'restart', description: '🔄 Restart the browser session' },
-    { name: 'stop',    description: '🛑 Stop the browser session' },
-    { name: 'ask',     description: '💬 Ask Grok something via voice' },
-    { name: 'reset',   description: '🔄 Reset Milo\'s conversation memory' },
-    { name: 'status',  description: '📊 Check Milo\'s status' },
+    { name: 'restart',   description: '🔄 Restart the browser session' },
+    { name: 'stop',      description: '🛑 Stop the browser session' },
+    { name: 'ask',       description: '💬 Ask Grok something via voice' },
+    { name: 'reset',     description: '🔄 Reset Milo\'s conversation memory' },
+    { name: 'status',    description: '📊 Check Milo\'s status' },
+    { name: 'closegrok', description: '🗑️ Close Grok tab to free memory' },
   ];
 
   client.once('ready', async () => {
@@ -649,10 +756,8 @@ async function startDiscordBot() {
   // ── VOICE STATE TRACKER ───────────────────────────────────────────────────
   client.on('voiceStateUpdate', async (oldState, newState) => {
     if (newState.member?.id !== OWNER_ID) return;
-
     const newChannel = newState.channel;
     const oldChannel = oldState.channel;
-
     if (newChannel && newChannel.id !== oldChannel?.id) {
       log('🔊', `Owner joined #${newChannel.name} — Milo following...`);
       await joinVoiceChannelById(newChannel.guild.id, newChannel.id);
@@ -665,10 +770,8 @@ async function startDiscordBot() {
   client.on('messageCreate', async message => {
     if (message.author.bot) return;
     if (message.author.id !== OWNER_ID) return;
-
     const raw = message.content.trim();
-    if (!raw) return;
-    if (!isMiloTagged(raw)) return;
+    if (!raw || !isMiloTagged(raw)) return;
 
     const text = stripMiloTag(raw);
     log('📩', `Owner tagged Milo with: "${text || '(empty)'}"`);
@@ -676,7 +779,6 @@ async function startDiscordBot() {
     if (isJoinVcIntent(text)) {
       const ownerMember = await message.guild.members.fetch(OWNER_ID).catch(() => null);
       const vcChannel   = ownerMember?.voice?.channel;
-
       if (vcChannel) {
         await message.react('🔊');
         const ok = await joinVoiceChannelById(message.guild.id, vcChannel.id);
@@ -728,7 +830,8 @@ async function startDiscordBot() {
     }
 
     if (cmd === 'ask') {
-      if (!grokPage) return interaction.reply({ content: '❌ Grok tab not open', flags: MessageFlags.Ephemeral });
+      if (!hasGrokAuth)
+        return interaction.reply({ content: '❌ GROK_COOKIES not set', flags: MessageFlags.Ephemeral });
       await interaction.showModal({
         customId: 'askModal', title: '💬 Ask Grok',
         components: [{
@@ -742,7 +845,15 @@ async function startDiscordBot() {
 
     if (cmd === 'reset') {
       resetConversation(interaction.channel.id);
-      await interaction.reply({ content: `🔄 ${PERSONA.name}'s memory wiped — fresh start!`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `🔄 ${PERSONA.name}'s memory wiped!`, flags: MessageFlags.Ephemeral });
+    }
+
+    if (cmd === 'closegrok') {
+      closeGrokTab();
+      await interaction.reply({
+        content: '🗑️ Grok tab closed (memory freed). Will re-open on next /ask.',
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     if (cmd === 'status') {
@@ -753,7 +864,7 @@ async function startDiscordBot() {
       const lines = [
         `🤖 **${PERSONA.name}** — ${browser ? '🟢 Running' : '🔴 Stopped'}`,
         `🌐 Browser  : ${browser     ? '✅ Open' : '❌ Closed'}`,
-        `🎙️ Grok tab : ${grokPage    ? '✅ Open' : '❌ Closed'}`,
+        `🎙️ Grok tab : ${grokPage    ? '✅ Open (auto-closes in 5min idle)' : '💤 Closed (opens on /ask)'}`,
         `💬 Discord  : ${discordPage ? '✅ Open' : '❌ Closed'}`,
         `🧠 DeepSeek : ${DEEPSEEK_API_KEY ? '✅ Enabled' : '❌ Disabled'}`,
         `👑 Owner    : ${OWNER_ID}`,
@@ -768,7 +879,7 @@ async function startDiscordBot() {
     if (!interaction.isModalSubmit()) return;
     if (interaction.customId === 'askModal') {
       const text = interaction.fields.getTextInputValue('askText');
-      await interaction.reply('⏳ Sending to Grok...');
+      await interaction.reply('⏳ Opening Grok and sending...');
       const ok = await sendToGrok(text);
       await interaction.editReply(ok ? '🔊 Grok is responding!' : '❌ Failed to reach Grok.');
     }
@@ -782,6 +893,7 @@ async function startDiscordBot() {
 // ─────────────────────────────────────────────────────────────────────────────
 function cleanupBrowser() {
   isBusy = false;
+  if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
   if (browser) { browser.close().catch(() => {}); browser = null; }
   browserCtx  = null;
   grokPage    = null;
