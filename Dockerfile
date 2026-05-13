@@ -47,9 +47,7 @@ RUN chmod -R 777 /ms-playwright
 COPY . .
 RUN chmod +x entrypoint.sh && chown -R node:node /app
 
-# noVNC port
 EXPOSE 6080
-# VNC port
 EXPOSE 5900
 
 USER node
