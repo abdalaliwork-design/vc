@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    image: grok-discord-bridge
+    container_name: grok-discord-bridge
+    restart: unless-stopped
+
+    # Required for PulseAudio shared memory
+    ipc: host
+    privileged: false
+
+    # Shared memory for Chromium
+    shm_size: "2gb"
+
+    ports:
+      - "6080:6080"   # noVNC web UI
+      - "5900:5900"   # Raw VNC
+
+    environment:
+      # ── Discord ──────────────────────────────────────────────
+      # Option A: Bot token (recommended) — gives slash commands + message reading
+      DISCORD_TOKEN: "${DISCORD_TOKEN}"
+
+      # Option B: Web login (if no bot token)
+      # DISCORD_EMAIL: "${DISCORD_EMAIL}"
+      # DISCORD_PASSWORD: "${DISCORD_PASSWORD}"
+
+      # ── X.com / Grok ─────────────────────────────────────────
+      X_USERNAME: "${X_USERNAME}"
+      X_PASSWORD: "${X_PASSWORD}"
+
+      # ── DeepSeek (persona text chat) ─────────────────────────
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+
+      # ── Persona ───────────────────────────────────────────────
+      PERSONA_NAME: "${PERSONA_NAME:-Alex}"
+      PERSONA_PERSONALITY: "${PERSONA_PERSONALITY:-a chill friend who knows everything}"
+
+      # ── Permissions ───────────────────────────────────────────
+      ALLOWED_USER_ID: "${ALLOWED_USER_ID:-}"   # Leave blank = everyone
+
+      # ── Channel names (for browser-only mode) ─────────────────
+      VOICE_CHANNEL_NAME: "${VOICE_CHANNEL_NAME:-General}"
+
+      # ── Audio ─────────────────────────────────────────────────
+      PULSE_LATENCY_MSEC: "80"
+
+      # ── Display ───────────────────────────────────────────────
+      DISPLAY: ":99"
+      NOVNC_PORT: "6080"
+
+    volumes:
+      # Persist browser profiles (stay logged in across restarts)
+      - browser_profile:/root/.config/chromium
+      - browser_profile:/root/.config/playwright
+
+    # Security: drop unnecessary capabilities
+    cap_add:
+      - SYS_ADMIN   # needed for Chromium sandbox (or use --no-sandbox)
+    cap_drop:
+      - NET_RAW
+
+volumes:
+  browser_profile:
+    driver: local
