@@ -42,13 +42,18 @@ const client = new Client({
 let browser = null;
 let context = null;
 let page = null;
+let cdpSession = null;
+
 let ffmpegOut = null;
 let ffmpegIn = null;
+
 let connection = null;
 let player = null;
 let grokPassthrough = null;
+
 let silenceInterval = null;
 let inputKeepAliveInterval = null;
+
 let isIdleBusy = false;
 let voiceInputReady = false;
 let sessionUserId = null;
@@ -58,7 +63,8 @@ let silenceTimeout = null;
 let isSendingToGrok = false;
 let currentDecoder = null;
 let activeAudioStream = null;
-let activeVoice = false;
+let isUserSpeaking = false;
+let speakingEndTimer = null;
 
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
 
@@ -71,19 +77,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function updateVoiceStatus(speaking) {
-  if (!statusChannel) return;
-  const content = speaking
-    ? '🟢 **صوتك وصل** — البوت يسمعك الآن 🎤'
-    : '🔴 **لا يوجد صوت** — تحدث في القناة الصوتية 🔇';
-  try {
-    if (statusMessage) await statusMessage.edit(content);
-    else statusMessage = await statusChannel.send(content);
-  } catch (e) {
-    console.error('❌ updateVoiceStatus:', e.message);
-  }
-}
-
 function safeKill(proc, signal = 'SIGKILL') {
   if (!proc) return;
   try {
@@ -91,8 +84,38 @@ function safeKill(proc, signal = 'SIGKILL') {
   } catch {}
 }
 
+async function postVoiceChat(text) {
+  if (!statusChannel) return;
+  try {
+    await statusChannel.send(text);
+  } catch (e) {
+    console.error('❌ postVoiceChat:', e.message);
+  }
+}
+
+async function updateVoiceStatus(speaking) {
+  if (!statusChannel) return;
+  const content = speaking
+    ? '🟢 **صوتك وصل** — البوت يسمعك الآن 🎤'
+    : '🔴 **لا يوجد صوت** — تحدث في القناة الصوتية 🔇';
+  try {
+    if (statusMessage) {
+      await statusMessage.edit(content);
+    } else {
+      statusMessage = await statusChannel.send(content);
+    }
+  } catch (e) {
+    console.error('❌ updateVoiceStatus:', e.message);
+  }
+}
+
 function cleanupInputStream() {
-  activeVoice = false;
+  isUserSpeaking = false;
+
+  if (speakingEndTimer) {
+    clearTimeout(speakingEndTimer);
+    speakingEndTimer = null;
+  }
 
   if (currentDecoder) {
     try {
@@ -119,6 +142,7 @@ function ensureInputPipeline() {
     '-loglevel', 'warning',
     '-nostdin',
     '-fflags', '+genpts',
+    '-thread_queue_size', '4096',
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
@@ -232,9 +256,31 @@ function initPlayer() {
 async function sendTextToGrok(text) {
   if (!page || isSendingToGrok) return;
   isSendingToGrok = true;
-  console.log(`📨 [GROK] Sending: "${text}"`);
+  console.log(`📨 [GROK] إرسال: "${text}"`);
 
   try {
+    const inVoiceMode = await page.evaluate(() => {
+      const ta = document.querySelector('textarea');
+      return !ta || ta.offsetParent === null;
+    });
+
+    if (inVoiceMode) {
+      console.log('🔄 الخروج من وضع الصوت مؤقتاً لإرسال النص...');
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(800);
+      await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        for (const btn of btns) {
+          const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+          if (label.includes('exit voice') || label.includes('stop voice') || label.includes('cancel')) {
+            btn.click();
+            return;
+          }
+        }
+      });
+      await page.waitForTimeout(800);
+    }
+
     const inputSelectors = [
       'textarea[placeholder]',
       'div[contenteditable="true"]',
@@ -246,23 +292,31 @@ async function sendTextToGrok(text) {
     for (const sel of inputSelectors) {
       try {
         inputEl = await page.waitForSelector(sel, { timeout: 3000, state: 'visible' });
-        if (inputEl) break;
+        if (inputEl) {
+          console.log(`✅ وجد المربع: ${sel}`);
+          break;
+        }
       } catch {}
     }
 
     if (!inputEl) {
-      console.error('❌ Could not find Grok input box');
+      console.error('❌ لم يتم العثور على مربع الإدخال');
       return;
     }
 
     await inputEl.click();
-    await page.keyboard.type(text, { delay: 25 });
+    await page.keyboard.type(text, { delay: 30 });
     await page.keyboard.press('Enter');
+    console.log('✅ [GROK] تم الإرسال — Grok سيرد بصوته');
 
-    console.log('✅ Text sent to Grok');
-
-    await sleep(1200);
-    await activateGrokVoiceMode();
+    await page.waitForTimeout(1500);
+    console.log('🔄 العودة لوضع الصوت...');
+    await page.keyboard.down('Control');
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('O');
+    await page.keyboard.up('Shift');
+    await page.keyboard.up('Control');
+    console.log('✅ تم إعادة تفعيل وضع الصوت');
   } catch (err) {
     console.error('❌ sendTextToGrok:', err.message);
   } finally {
@@ -274,7 +328,14 @@ function startUserAudioCapture(receiver) {
   if (activeAudioStream || currentDecoder) return;
 
   ensureInputPipeline();
-  activeVoice = true;
+  isUserSpeaking = true;
+
+  if (speakingEndTimer) {
+    clearTimeout(speakingEndTimer);
+    speakingEndTimer = null;
+  }
+
+  postVoiceChat(`🎤 <@${ALLOWED_USER_ID}> user talk`);
   updateVoiceStatus(true);
 
   currentDecoder = new prism.opus.Decoder({
@@ -291,46 +352,55 @@ function startUserAudioCapture(receiver) {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
   });
 
-  activeAudioStream.on('error', (err) => {
+  activeAudioStream.on('error', async (err) => {
     console.error('❌ audioStream error:', err.message);
     cleanupInputStream();
-    updateVoiceStatus(false);
+    await updateVoiceStatus(false);
   });
 
-  activeAudioStream.on('end', () => {
+  activeAudioStream.on('end', async () => {
     cleanupInputStream();
-    silenceTimeout = setTimeout(() => updateVoiceStatus(false), 500);
+    await postVoiceChat(`🔇 <@${ALLOWED_USER_ID}> user stopped`);
+    await updateVoiceStatus(false);
   });
 
   activeAudioStream.pipe(currentDecoder).pipe(ffmpegIn.stdin, { end: false });
 }
 
 function setupVoiceInput(receiver) {
-  console.log(`🎧 Setting up voice receiver for ${ALLOWED_USER_ID}`);
+  console.log(`🎧 إعداد استقبال الصوت لـ: ${ALLOWED_USER_ID}`);
 
   receiver.speaking.on('start', (userId) => {
     if (userId !== ALLOWED_USER_ID) return;
+
     if (silenceTimeout) {
       clearTimeout(silenceTimeout);
       silenceTimeout = null;
     }
-    if (activeAudioStream) return;
 
-    console.log('🎤 [SPEAKING] user started talking');
+    if (isUserSpeaking || activeAudioStream) return;
+
+    console.log('🎤 [SPEAKING] المستخدم يتكلم...');
     startUserAudioCapture(receiver);
   });
 
   receiver.speaking.on('end', (userId) => {
     if (userId !== ALLOWED_USER_ID) return;
-    console.log('🎤 [STOPPED] user stopped talking');
-    activeVoice = false;
-    silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
+    console.log('🎤 [STOPPED] انتهى الصوت');
+
+    if (speakingEndTimer) clearTimeout(speakingEndTimer);
+    speakingEndTimer = setTimeout(async () => {
+      if (!isUserSpeaking) return;
+      isUserSpeaking = false;
+      await postVoiceChat(`🔇 <@${ALLOWED_USER_ID}> user stopped`);
+      await updateVoiceStatus(false);
+    }, 500);
   });
 
   if (!inputKeepAliveInterval) {
     inputKeepAliveInterval = setInterval(() => {
       if (!ffmpegIn?.stdin?.writable) return;
-      if (!activeVoice) {
+      if (!isUserSpeaking) {
         ffmpegIn.stdin.write(SILENCE_FRAME);
       }
     }, 20);
@@ -339,7 +409,7 @@ function setupVoiceInput(receiver) {
 
 async function activateGrokVoiceMode() {
   if (!page) return false;
-  console.log('🎙️ Activating Grok voice mode...');
+  console.log('🎙️ تفعيل وضع الصوت في Grok...');
 
   try {
     const dismissSelectors = [
@@ -352,9 +422,20 @@ async function activateGrokVoiceMode() {
 
     for (const sel of dismissSelectors) {
       try {
-        await page.click(sel, { timeout: 1200 });
-        await sleep(300);
+        await page.click(sel, { timeout: 1500 });
+        console.log(`✅ أُغلق: ${sel}`);
+        await page.waitForTimeout(400);
       } catch {}
+    }
+
+    try {
+      await page.waitForSelector('form, textarea, [role="textbox"], [contenteditable="true"]', {
+        timeout: 10000,
+        state: 'visible',
+      });
+      console.log('✅ منطقة الإدخال جاهزة');
+    } catch {
+      console.warn('⚠️ لم تظهر منطقة الإدخال بعد 10 ثوانٍ');
     }
 
     await page.waitForTimeout(800);
@@ -376,12 +457,12 @@ async function activateGrokVoiceMode() {
 
     for (const sel of voiceButtonSelectors) {
       try {
-        const btn = await page.waitForSelector(sel, { timeout: 1800, state: 'visible' });
+        const btn = await page.waitForSelector(sel, { timeout: 2000, state: 'visible' });
         if (btn) {
           await btn.scrollIntoViewIfNeeded();
           await btn.click({ force: true });
+          console.log(`✅ [Strategy-1] نقر على: ${sel}`);
           clicked = true;
-          console.log(`✅ voice button clicked: ${sel}`);
           break;
         }
       } catch {}
@@ -390,6 +471,7 @@ async function activateGrokVoiceMode() {
     if (!clicked) {
       const result = await page.evaluate(() => {
         const allBtns = Array.from(document.querySelectorAll('button'));
+
         for (const btn of allBtns) {
           const text = [
             btn.getAttribute('aria-label'),
@@ -399,27 +481,69 @@ async function activateGrokVoiceMode() {
 
           if (/voice|mic|audio|speak|waveform|sound/.test(text)) {
             btn.click();
-            return `match:${text.slice(0, 80)}`;
+            return `text-match: "${text.substring(0, 60)}"`;
           }
         }
+
+        const form = document.querySelector('form');
+        if (form) {
+          const btns = Array.from(form.querySelectorAll('button'));
+          for (const btn of btns) {
+            const paths = btn.querySelectorAll('svg path, svg rect, svg circle');
+            if (paths.length >= 2) {
+              const rect = btn.getBoundingClientRect();
+              if (rect.top > window.innerHeight * 0.55 && rect.width > 0) {
+                btn.click();
+                return `svg-form-btn at y=${Math.round(rect.top)} paths=${paths.length}`;
+              }
+            }
+          }
+          const visibleBtns = btns.filter((b) => {
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+          if (visibleBtns.length > 0) {
+            visibleBtns[visibleBtns.length - 1].click();
+            return `last-form-btn (total ${visibleBtns.length})`;
+          }
+        }
+
+        for (const btn of allBtns) {
+          const rect = btn.getBoundingClientRect();
+          const style = window.getComputedStyle(btn);
+          const radius = parseInt(style.borderRadius) || 0;
+          if (radius >= 20 && rect.top > window.innerHeight * 0.6 && rect.width > 0) {
+            btn.click();
+            return `round-btn at y=${Math.round(rect.top)} r=${radius}`;
+          }
+        }
+
         return null;
       });
 
       if (result) {
+        console.log(`✅ [Strategy-2] نقر: ${result}`);
         clicked = true;
-        console.log(`✅ voice button clicked: ${result}`);
+      } else {
+        console.warn('⚠️ [Strategy-2] لم يُعثر على زر الصوت');
       }
     }
 
-    await sleep(1200);
+    await page.waitForTimeout(1200);
 
-    if (context) {
-      try {
-        await context.grantPermissions(['microphone', 'camera'], { origin: GROK_URL });
-      } catch (e) {
-        console.warn('⚠️ grantPermissions:', e.message);
+    try {
+      if (cdpSession) {
+        await cdpSession.send('Browser.grantPermissions', {
+          permissions: ['audioCapture', 'videoCapture'],
+          origin: GROK_URL,
+        });
+        console.log('✅ CDP mic re-granted after voice button click');
       }
+    } catch (e) {
+      console.warn('⚠️ CDP re-grant:', e.message);
     }
+
+    await page.waitForTimeout(800);
 
     const inVoiceMode = await page.evaluate(() => {
       const voiceUI = document.querySelector(
@@ -431,11 +555,11 @@ async function activateGrokVoiceMode() {
     });
 
     if (inVoiceMode) {
-      console.log('✅ Voice mode enabled');
+      console.log('✅ وضع الصوت مُفعَّل — الميكروفون يستمع 🎤');
       return true;
     }
 
-    console.warn('⚠️ Voice mode not confirmed');
+    console.warn('⚠️ وضع الصوت غير مُفعَّل');
     return false;
   } catch (err) {
     console.error('❌ activateGrokVoiceMode:', err.message);
@@ -626,17 +750,33 @@ client.on('interactionCreate', async (interaction) => {
 
       await new Promise((resolve) => {
         const state = connection.state.status;
-        if (state === VoiceConnectionStatus.Ready) return resolve();
+        console.log(`🔗 Voice connection state: ${state}`);
 
-        const timer = setTimeout(() => resolve(), 10000);
+        if (state === VoiceConnectionStatus.Ready) {
+          return resolve();
+        }
+
+        if (
+          state === VoiceConnectionStatus.Destroyed ||
+          state === VoiceConnectionStatus.Disconnected
+        ) {
+          return resolve();
+        }
+
+        const timer = setTimeout(() => {
+          console.warn(`⚠️ تهيئة إجبارية — الحالة: ${connection.state.status}`);
+          resolve();
+        }, 10000);
 
         connection.once(VoiceConnectionStatus.Ready, () => {
           clearTimeout(timer);
+          console.log('✅ الاتصال الصوتي جاهز!');
           resolve();
         });
 
         connection.once(VoiceConnectionStatus.Disconnected, () => {
           clearTimeout(timer);
+          console.warn('⚠️ انقطع الاتصال أثناء الانتظار');
           resolve();
         });
       });
@@ -647,14 +787,21 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        console.warn('⚠️ Voice disconnected');
+        console.warn('⚠️ انقطع الاتصال — محاولة إعادة الاتصال...');
+        voiceInputReady = false;
         try {
           await Promise.race([
             entersState(connection, VoiceConnectionStatus.Signalling, 5000),
             entersState(connection, VoiceConnectionStatus.Connecting, 5000),
           ]);
           await entersState(connection, VoiceConnectionStatus.Ready, 10000);
+          console.log('✅ أُعيد الاتصال الصوتي!');
+          if (!voiceInputReady) {
+            voiceInputReady = true;
+            setupVoiceInput(connection.receiver);
+          }
         } catch {
+          console.error('❌ فشل إعادة الاتصال — تنظيف...');
           cleanupAll();
         }
       });
@@ -664,13 +811,13 @@ client.on('interactionCreate', async (interaction) => {
         `🔒 للمستخدم <@${ALLOWED_USER_ID}> فقط\n` +
         '🔊 صوت Grok → Discord\n' +
         '🎤 صوتك → Grok\n' +
-        '💬 اكتب هنا → يُرسل لـ Grok\n' +
+        '💬 اكتب هنا → يُرسل لـ Grok (يرد بصوته)\n' +
         '🖥️ noVNC لمشاهدة الشاشة'
       );
 
       await updateVoiceStatus(false);
     } catch (error) {
-      console.error('❌ start failed:', error);
+      console.error('❌ فشل التشغيل:', error);
       await interaction.editReply('❌ فشل: ' + error.message);
       cleanupAll();
     }
@@ -687,14 +834,21 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 function cleanupAll() {
+  if (speakingEndTimer) {
+    clearTimeout(speakingEndTimer);
+    speakingEndTimer = null;
+  }
+
   if (silenceTimeout) {
     clearTimeout(silenceTimeout);
     silenceTimeout = null;
   }
+
   if (silenceInterval) {
     clearInterval(silenceInterval);
     silenceInterval = null;
   }
+
   if (inputKeepAliveInterval) {
     clearInterval(inputKeepAliveInterval);
     inputKeepAliveInterval = null;
@@ -702,8 +856,14 @@ function cleanupAll() {
 
   voiceInputReady = false;
   isSendingToGrok = false;
+  isUserSpeaking = false;
 
   cleanupInputStream();
+
+  if (cdpSession) {
+    cdpSession.detach().catch(() => {});
+    cdpSession = null;
+  }
 
   if (ffmpegOut) {
     try {
@@ -755,9 +915,8 @@ function cleanupAll() {
   sessionUserId = null;
   statusMessage = null;
   statusChannel = null;
-  activeVoice = false;
 
-  console.log('🧹 Cleaned up all resources');
+  console.log('🧹 تم تنظيف جميع الموارد');
 }
 
 process.on('SIGINT', () => {
@@ -768,6 +927,14 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
   cleanupAll();
   process.exit(0);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('❌ unhandledRejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('❌ uncaughtException:', err);
 });
 
 client.login(DISCORD_TOKEN);
