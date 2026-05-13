@@ -48,6 +48,7 @@ let statusMessage   = null;
 let statusChannel   = null;
 let silenceTimeout  = null;
 let isSendingToGrok = false;
+let currentDecoder  = null;
 
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
 
@@ -73,17 +74,14 @@ async function sendTextToGrok(text) {
     isSendingToGrok = true;
     console.log(`📨 [GROK] إرسال: "${text}"`);
     try {
-        // ✅ If in voice mode, exit it first so textarea appears
         const inVoiceMode = await page.evaluate(() => {
             const ta = document.querySelector('textarea');
             return !ta || ta.offsetParent === null;
         });
         if (inVoiceMode) {
             console.log('🔄 الخروج من وضع الصوت مؤقتاً لإرسال النص...');
-            // Press Escape or click stop voice button
             await page.keyboard.press('Escape');
             await page.waitForTimeout(800);
-            // Also try clicking any "exit voice" or "stop" button
             await page.evaluate(() => {
                 const btns = Array.from(document.querySelectorAll('button'));
                 for (const btn of btns) {
@@ -119,7 +117,6 @@ async function sendTextToGrok(text) {
         await page.keyboard.press('Enter');
         console.log('✅ [GROK] تم الإرسال — Grok سيرد بصوته');
 
-        // ✅ Re-enter voice mode after sending text
         await page.waitForTimeout(1500);
         console.log('🔄 العودة لوضع الصوت...');
         await page.keyboard.down('Control');
@@ -140,15 +137,17 @@ async function sendTextToGrok(text) {
 function startGrokAudio() {
     if (ffmpegOut) { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     console.log('🔊 FFmpeg: DiscordSink.monitor → Discord');
+
+    // FIX: removed double aresample filter, use explicit -ar/-ac output spec
     ffmpegOut = spawn('ffmpeg', [
-        '-loglevel', 'warning',
+        '-loglevel', 'error',
         '-f', 'pulse', '-i', 'DiscordSink.monitor',
         '-fflags', 'nobuffer+discardcorrupt',
         '-flags', 'low_delay',
-        '-af', 'aresample=async=1000,aresample=48000',  // ✅ force 48000Hz output
-        '-ac', '2', '-ar', '48000',
+        '-ar', '48000', '-ac', '2',
         '-f', 's16le', '-acodec', 'pcm_s16le', 'pipe:1'
     ]);
+
     ffmpegOut.stdout.pipe(grokPassthrough, { end: false });
     ffmpegOut.stderr.on('data', d => {
         const msg = d.toString().trim();
@@ -184,25 +183,27 @@ function initPlayer() {
 }
 
 // ─── User voice → DiscordMic → Grok browser ──────────────────────────────────
+// FIX: rewritten to use receiver.speaking events (Discord VAD) for reliable detection
 function setupVoiceInput(receiver) {
-    console.log(`🎧 استقبال صوت: ${ALLOWED_USER_ID}`);
-    function listenToUser() {
-        if (!connection || !sessionUserId) return;
+    console.log(`🎧 إعداد استقبال الصوت لـ: ${ALLOWED_USER_ID}`);
 
-        const audioStream = receiver.subscribe(ALLOWED_USER_ID, {
-            end: { behavior: EndBehaviorType.AfterSilence, duration: 600 }
-        });
-        console.log(`🔔 [VOICE] مشترك في صوت المستخدم — في انتظار الصوت...`);
+    receiver.speaking.on('start', (userId) => {
+        if (userId !== ALLOWED_USER_ID) return;
 
-        let hasData = false;
+        if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
+        console.log('🎤 [SPEAKING] المستخدم يتكلم...');
+        updateVoiceStatus(true);
 
-        // ✅ Spawn FFmpeg first so it's ready to receive piped audio immediately
+        // Kill any lingering previous session
+        if (currentDecoder) { try { currentDecoder.destroy(); } catch {} currentDecoder = null; }
         if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
+
+        // FIX: removed double aresample, added explicit output -ar/-ac
         ffmpegIn = spawn('ffmpeg', [
-            '-loglevel', 'warning',
+            '-loglevel', 'error',
             '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', 'pipe:0',
-            '-af', 'aresample=async=1000,aresample=48000',
-            '-f', 'pulse', '-device', 'DiscordMic',  // -device routes to the sink; the last arg is just the stream label
+            '-ar', '48000', '-ac', '2',
+            '-f', 'pulse', '-device', 'DiscordMic',
             'discord_voice_in',
         ]);
         ffmpegIn.stderr.on('data', d => {
@@ -210,55 +211,46 @@ function setupVoiceInput(receiver) {
             if (m && !m.includes('Guessed') && !m.includes('monoton')) console.error('[FFmpeg-IN]', m);
         });
         ffmpegIn.on('error', err => console.error('❌ FFmpeg-IN spawn:', err.message));
-        ffmpegIn.stdin.on('error', () => {}); // prevent EPIPE crash
+        ffmpegIn.stdin.on('error', () => {});
 
-        // ✅ Decode Opus → PCM → FFmpeg stdin
-        const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-        opusDecoder.on('error', err => console.error('❌ OpusDecoder:', err.message));
+        currentDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+        currentDecoder.on('error', err => console.error('❌ OpusDecoder:', err.message));
 
-        audioStream.on('data', () => {
-            if (!hasData) {
-                hasData = true;
-                if (silenceTimeout) { clearTimeout(silenceTimeout); silenceTimeout = null; }
-                console.log(`\n🎤 [SPEAKING] المستخدم يتكلم...`);
-                updateVoiceStatus(true);
-            }
+        const audioStream = receiver.subscribe(ALLOWED_USER_ID, {
+            end: { behavior: EndBehaviorType.AfterSilence, duration: 500 }
         });
 
-        audioStream.pipe(opusDecoder).pipe(ffmpegIn.stdin, { end: false });
+        audioStream.pipe(currentDecoder).pipe(ffmpegIn.stdin, { end: false });
 
         audioStream.on('end', () => {
-            if (hasData) {
-                console.log(`🎤 [STOPPED] انتهى الصوت`);
-                silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
-            }
-            opusDecoder.unpipe(ffmpegIn.stdin);
+            if (currentDecoder) { try { currentDecoder.destroy(); } catch {} currentDecoder = null; }
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-            setTimeout(() => listenToUser(), 100);
         });
-
         audioStream.on('error', (err) => {
             console.error('❌ audioStream error:', err.message);
+            if (currentDecoder) { try { currentDecoder.destroy(); } catch {} currentDecoder = null; }
             if (ffmpegIn) { ffmpegIn.kill('SIGKILL'); ffmpegIn = null; }
-            setTimeout(() => listenToUser(), 500);
         });
-    }
-    listenToUser();
+    });
+
+    receiver.speaking.on('end', (userId) => {
+        if (userId !== ALLOWED_USER_ID) return;
+        console.log('🎤 [STOPPED] انتهى الصوت');
+        silenceTimeout = setTimeout(() => updateVoiceStatus(false), 800);
+    });
 }
 
 // ─── GRANT MIC VIA CDP + CLICK VOICE BUTTON ──────────────────────────────────
 async function activateGrokVoiceMode() {
-    if (!page) return;
+    if (!page) return false;
     console.log('🎙️ تفعيل وضع الصوت في Grok...');
 
-    // Handle any JS dialogs that might block clicks
     page.on('dialog', async dialog => {
         console.log(`📢 Dialog: ${dialog.type()} — ${dialog.message()}`);
         await dialog.dismiss();
     });
 
     try {
-        // ── Step 1: Dismiss any popups / overlays ─────────────────────────
         const dismissSelectors = [
             'button:has-text("Dismiss")',
             'button:has-text("Got it")',
@@ -274,28 +266,23 @@ async function activateGrokVoiceMode() {
             } catch { /* not present */ }
         }
 
-        // ── Step 2: Wait for the input area to be ready ───────────────────
         try {
-            await page.waitForSelector('form, textarea, [role="textbox"]', { timeout: 10000, state: 'visible' });
+            await page.waitForSelector('form, textarea, [role="textbox"], [contenteditable="true"]', { timeout: 10000, state: 'visible' });
             console.log('✅ منطقة الإدخال جاهزة');
         } catch {
             console.warn('⚠️ لم تظهر منطقة الإدخال بعد 10 ثوانٍ');
         }
         await page.waitForTimeout(800);
 
-        // ── Step 3: Try specific Grok voice button selectors first ────────
         const voiceButtonSelectors = [
-            // Grok's actual voice mode button (by aria-label)
             'button[aria-label*="voice" i]',
             'button[aria-label*="Voice" i]',
             'button[aria-label*="mic" i]',
             'button[aria-label*="Mic" i]',
             'button[aria-label*="audio" i]',
             'button[aria-label*="speak" i]',
-            // data-testid patterns Grok might use
             '[data-testid*="voice"]',
             '[data-testid*="mic"]',
-            // Title attribute fallbacks
             'button[title*="voice" i]',
             'button[title*="mic" i]',
         ];
@@ -314,12 +301,10 @@ async function activateGrokVoiceMode() {
             } catch { /* try next */ }
         }
 
-        // ── Step 4: Fallback — scan all buttons by text/SVG heuristics ────
         if (!clicked) {
             const result = await page.evaluate(() => {
                 const allBtns = Array.from(document.querySelectorAll('button'));
 
-                // 4a: Match by any voice/mic keyword in accessible text
                 for (const btn of allBtns) {
                     const text = [
                         btn.getAttribute('aria-label'),
@@ -332,24 +317,19 @@ async function activateGrokVoiceMode() {
                     }
                 }
 
-                // 4b: Grok's voice button sits in the form's bottom-right area
-                //     It's typically a round button with a microphone/waveform SVG
                 const form = document.querySelector('form');
                 if (form) {
                     const btns = Array.from(form.querySelectorAll('button'));
-                    // Prefer buttons with an SVG child and at least 2 paths (waveform)
                     for (const btn of btns) {
                         const paths = btn.querySelectorAll('svg path, svg rect, svg circle');
                         if (paths.length >= 2) {
                             const rect = btn.getBoundingClientRect();
-                            // Must be in the lower portion of the viewport
                             if (rect.top > window.innerHeight * 0.55 && rect.width > 0) {
                                 btn.click();
                                 return `svg-form-btn at y=${Math.round(rect.top)} paths=${paths.length}`;
                             }
                         }
                     }
-                    // Last resort: last visible button in form
                     const visibleBtns = btns.filter(b => {
                         const r = b.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
@@ -360,7 +340,6 @@ async function activateGrokVoiceMode() {
                     }
                 }
 
-                // 4c: Any round button in the bottom half of the screen
                 for (const btn of allBtns) {
                     const rect = btn.getBoundingClientRect();
                     const style = window.getComputedStyle(btn);
@@ -384,10 +363,7 @@ async function activateGrokVoiceMode() {
 
         await page.waitForTimeout(1200);
 
-        // ── Step 5: Verify mic permission dialog and accept it ─────────────
-        // Chrome may show a permission bubble after clicking voice
         try {
-            // Re-grant via CDP in case the origin changed after navigation
             if (cdpSession) {
                 await cdpSession.send('Browser.grantPermissions', {
                     permissions: ['audioCapture', 'videoCapture'],
@@ -399,28 +375,25 @@ async function activateGrokVoiceMode() {
             console.warn('⚠️ CDP re-grant:', e.message);
         }
 
-        // ── Step 6: Confirm voice mode is active ──────────────────────────
         await page.waitForTimeout(800);
-        const inVoiceMode = await page.evaluate(() => {
-            // Voice mode: textarea hidden OR a mic/waveform animation visible
-            const ta = document.querySelector('textarea');
-            const textareaHidden = !ta || ta.offsetParent === null;
 
-            // Also check for any animated voice UI element
+        // FIX: correct voice mode detection — require actual voice UI, not absence of textarea
+        // (grok.com uses contenteditable, not textarea, so !textarea was always true = false positive)
+        const inVoiceMode = await page.evaluate(() => {
             const voiceUI = document.querySelector(
                 '[class*="voice"], [class*="mic"], [class*="waveform"], [class*="listening"]'
             );
-            return textareaHidden || !!voiceUI;
+            const ta = document.querySelector('textarea');
+            const textareaHidden = ta && ta.offsetParent === null;
+            return !!voiceUI || textareaHidden;
         });
 
         if (inVoiceMode) {
             console.log('✅ وضع الصوت مُفعَّل — الميكروفون يستمع 🎤');
-            console.log('✅ activateGrokVoiceMode مكتمل');
-            return true;   // ← caller must NOT send Ctrl+Shift+O (would toggle OFF)
+            return true;
         } else {
-            console.warn('⚠️ وضع الصوت غير مُفعَّل بعد — يحتاج Ctrl+Shift+O');
-            console.log('✅ activateGrokVoiceMode مكتمل');
-            return false;  // ← caller should try Ctrl+Shift+O
+            console.warn('⚠️ وضع الصوت غير مُفعَّل — يحتاج Ctrl+Shift+O');
+            return false;
         }
 
     } catch (err) {
@@ -492,27 +465,29 @@ client.on('interactionCreate', async (interaction) => {
             });
             connection.subscribe(player);
 
-            // ✅ Launch WITHOUT --use-fake-ui-for-media-stream so real PulseAudio mic works
-            // ✅ Use --use-fake-device-for-media-stream to keep Chrome from complaining about no hardware
+            // FIX: pass PulseAudio env vars explicitly so Chrome inherits them inside Playwright's sandbox
             browser = await chromium.launch({
                 headless: false,
+                env: {
+                    ...process.env,
+                    PULSE_SINK: 'DiscordSink',
+                    PULSE_SOURCE: 'VirtualMic',
+                    PULSE_LATENCY_MSEC: '30',
+                    DISPLAY: ':99',
+                },
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--autoplay-policy=no-user-gesture-required',
-                    // ✅ Suppresses the mic/camera PERMISSION DIALOG without faking the device
-                    //    (different from --use-fake-device-for-media-stream which silences audio)
                     '--use-fake-ui-for-media-stream',
                     '--allow-file-access-from-files',
                     '--disable-web-security',
                     '--disable-features=WebRtcHideLocalIpsWithMdns',
-                    // ✅ Force Chrome to use PulseAudio for both input and output
                     '--enable-features=PulseAudio',
                 ]
             });
 
-            // ✅ Context with mic pre-granted at the browser context level
             const context = await browser.newContext({
                 permissions: ['microphone', 'camera'],
             });
@@ -547,9 +522,7 @@ client.on('interactionCreate', async (interaction) => {
 
             page = await context.newPage();
 
-            // ✅ Inject permission + getUserMedia overrides BEFORE page loads
             await page.addInitScript(() => {
-                // 1. Make permissions.query always return 'granted' for mic/camera
                 const origQuery = navigator.permissions.query.bind(navigator.permissions);
                 navigator.permissions.query = (p) => {
                     if (p && (p.name === 'microphone' || p.name === 'camera')) {
@@ -558,7 +531,6 @@ client.on('interactionCreate', async (interaction) => {
                     return origQuery(p);
                 };
 
-                // 2. Override getUserMedia to use PulseAudio VirtualMic (disable processing that interferes)
                 const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
                 navigator.mediaDevices.getUserMedia = (constraints) => {
                     if (constraints && constraints.audio) {
@@ -566,7 +538,6 @@ client.on('interactionCreate', async (interaction) => {
                             echoCancellation: false,
                             noiseSuppression: false,
                             autoGainControl: false,
-                            // Don't restrict to a specific deviceId — let PulseAudio default source work
                         };
                     }
                     return origGUM(constraints);
@@ -575,7 +546,6 @@ client.on('interactionCreate', async (interaction) => {
                 console.log('[BOT] Permission + getUserMedia overrides injected');
             });
 
-            // ✅ Grant mic via CDP BEFORE navigating — this is the critical order fix
             try {
                 cdpSession = await context.newCDPSession(page);
                 await cdpSession.send('Browser.grantPermissions', {
@@ -587,22 +557,17 @@ client.on('interactionCreate', async (interaction) => {
                 console.warn('⚠️ CDP grant failed (non-fatal):', cdpErr.message);
             }
 
-            // ✅ Use domcontentloaded — grok.com never reaches networkidle (keeps WS alive)
             try {
                 await page.goto('https://grok.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
             } catch (navErr) {
-                // If even domcontentloaded times out, try load event
                 console.warn('⚠️ domcontentloaded timeout, retrying with load...');
                 await page.goto('https://grok.com', { waitUntil: 'load', timeout: 60000 });
             }
-            // Wait for page to settle (React hydration, lazy loads)
             await page.waitForTimeout(3000);
             console.log('✅ Grok محمّل.');
 
             const voiceActivated = await activateGrokVoiceMode();
 
-            // ✅ Only try Ctrl+Shift+O if the button click failed — NOT if it succeeded
-            //    (Ctrl+Shift+O is a toggle — sending it when already active turns voice OFF)
             if (!voiceActivated) {
                 console.warn('⚠️ زر الصوت فشل — تجربة Ctrl+Shift+O');
                 await page.keyboard.down('Control');
@@ -617,7 +582,6 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             // ─── Voice connection ─────────────────────────────────────────
-            // ✅ Proper Ready wait — handles case where Ready already fired before we get here
             await new Promise((resolve) => {
                 const status = connection.state.status;
                 console.log(`🔗 Voice connection state: ${status}`);
@@ -627,7 +591,6 @@ client.on('interactionCreate', async (interaction) => {
                     return resolve();
                 }
 
-                // If destroyed/disconnected already, just proceed with forced init
                 if (status === VoiceConnectionStatus.Destroyed ||
                     status === VoiceConnectionStatus.Disconnected) {
                     console.warn(`⚠️ الاتصال في حالة ${status} — متابعة بدون انتظار`);
@@ -645,7 +608,6 @@ client.on('interactionCreate', async (interaction) => {
                     resolve();
                 });
 
-                // Also resolve if it disconnects (avoid hanging)
                 connection.once(VoiceConnectionStatus.Disconnected, () => {
                     clearTimeout(timer);
                     console.warn('⚠️ انقطع الاتصال أثناء الانتظار');
@@ -667,7 +629,6 @@ client.on('interactionCreate', async (interaction) => {
                         entersState(connection, VoiceConnectionStatus.Signalling, 5000),
                         entersState(connection, VoiceConnectionStatus.Connecting, 5000),
                     ]);
-                    // Reconnected — wait for Ready again
                     await entersState(connection, VoiceConnectionStatus.Ready, 10000);
                     console.log('✅ أُعيد الاتصال الصوتي!');
                     if (!voiceInputReady) {
@@ -712,6 +673,7 @@ function cleanupAll() {
     if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
     voiceInputReady = false;
     isSendingToGrok = false;
+    if (currentDecoder)  { try { currentDecoder.destroy(); } catch {} currentDecoder = null; }
     if (cdpSession)      { cdpSession.detach().catch(() => {}); cdpSession = null; }
     if (ffmpegOut)       { ffmpegOut.stdout.unpipe(); ffmpegOut.kill('SIGKILL'); ffmpegOut = null; }
     if (ffmpegIn)        { ffmpegIn.kill('SIGKILL');  ffmpegIn  = null; }
