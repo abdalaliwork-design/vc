@@ -17,7 +17,7 @@ const DISCORD_PASSWORD = process.env.DISCORD_PASSWORD || null;
 const DISCORD_COOKIES  = process.env.DISCORD_COOKIES  || null;
 const GROK_COOKIES     = process.env.GROK_COOKIES     || null;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || null;
-const GROK_URL         = 'https://x.com/i/grok';
+const GROK_URL         = 'https://grok.com';
 
 // Milo's real Discord account ID (the browser session account)
 const MILO_ACCOUNT_ID = process.env.MILO_ACCOUNT_ID || '1504162446196080754';
@@ -126,15 +126,24 @@ function parseCookies(raw, domain) {
   if (raw.startsWith('[')) {
     try {
       const arr = JSON.parse(raw);
-      return arr.map(c => ({
-        name:     c.name,
-        value:    c.value,
-        domain:   c.domain   || domain,
-        path:     c.path     || '/',
-        secure:   c.secure   !== undefined ? c.secure : true,
-        httpOnly: c.httpOnly !== undefined ? c.httpOnly : false,
-        sameSite: normalizeSameSite(c.sameSite),
-      }));
+      return arr.map(c => {
+        // hostOnly cookies exported as "grok.com" need a leading dot for Playwright
+        // unless they really are host-only (no dot), in which case keep as-is
+        const cookieDomain = c.domain || domain;
+        const cookie = {
+          name:     c.name,
+          value:    c.value,
+          domain:   cookieDomain,
+          path:     c.path     || '/',
+          secure:   c.secure   !== undefined ? c.secure   : true,
+          httpOnly: c.httpOnly !== undefined ? c.httpOnly : false,
+          sameSite: normalizeSameSite(c.sameSite),
+        };
+        // Map expirationDate (cookie exporter format) → expires (Playwright format)
+        const exp = c.expires ?? c.expirationDate;
+        if (exp && !c.session) cookie.expires = Math.floor(exp);
+        return cookie;
+      }).filter(c => c.name && c.value !== undefined);
     } catch (e) {
       log('⚠️', 'Cookie JSON parse failed, trying raw string...');
     }
@@ -150,7 +159,7 @@ function parseCookies(raw, domain) {
       path:     '/',
       secure:   true,
       httpOnly: false,
-      sameSite: normalizeSameSite(undefined),
+      sameSite: 'None',
     };
   }).filter(Boolean);
 }
@@ -292,15 +301,24 @@ async function openDiscordTab(ctx) {
   }
 
   await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleep(3000);
+  await sleep(4000);
 
-  if (discordPage.url().includes('login')) {
+  if (discordPage.url().includes('login') || discordPage.url().includes('register')) {
     log('🔑', 'Cookie auth failed — trying fallback auth...');
     await loginToDiscordWeb(discordPage);
   }
 
-  await discordPage.waitForSelector('[class*="sidebar"], [class*="guilds"]', { timeout: 30000 }).catch(() => {});
-  log('✅', 'Discord Web tab ready (Milo is online)');
+  // Wait for the Discord app shell to appear
+  const appReady = await discordPage.waitForSelector(
+    '[class*="sidebar"], [class*="guilds"], [class*="app-"]',
+    { timeout: 40000 }
+  ).catch(() => null);
+
+  if (appReady) {
+    log('✅', 'Discord Web tab ready (Milo is online)');
+  } else {
+    log('⚠️', 'Discord Web tab loaded but app shell not detected — may still work');
+  }
 }
 
 async function loginToDiscordWeb(page) {
@@ -314,22 +332,45 @@ async function loginToDiscordWeb(page) {
       iframe.remove();
     }, DISCORD_TOKEN);
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await sleep(3000);
+    await sleep(4000);
     return;
   }
 
   if (DISCORD_EMAIL && DISCORD_PASSWORD) {
+    log('🔑', 'Logging in with email + password...');
     try {
-      await page.waitForSelector('input[name="email"]', { timeout: 10000 });
+      // Make sure we're on the login page
+      if (!page.url().includes('login')) {
+        await page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(2000);
+      }
+      await page.waitForSelector('input[name="email"]', { timeout: 15000 });
       await page.fill('input[name="email"]', DISCORD_EMAIL);
+      await sleep(300);
       await page.fill('input[name="password"]', DISCORD_PASSWORD);
+      await sleep(300);
       await page.click('button[type="submit"]');
-      await sleep(4000);
-      log('✅', 'Discord login submitted');
+      await sleep(5000);
+
+      // Handle 2FA prompt if present
+      const twoFaInput = await page.$('input[name="code"], input[placeholder*="6-digit"]');
+      if (twoFaInput) {
+        log('⚠️', 'Discord is asking for 2FA — cannot proceed automatically. Disable 2FA or use cookies.');
+        return;
+      }
+
+      if (!page.url().includes('login')) {
+        log('✅', 'Discord email/password login succeeded');
+      } else {
+        log('❌', 'Discord login failed — check your DISCORD_EMAIL / DISCORD_PASSWORD');
+      }
     } catch (err) {
-      log('❌', 'Discord login error:', err.message);
+      log('❌', 'Discord email login error:', err.message);
     }
+    return;
   }
+
+  log('❌', 'No Discord auth available — set DISCORD_TOKEN, DISCORD_COOKIES, or DISCORD_EMAIL+DISCORD_PASSWORD');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
