@@ -24,8 +24,8 @@ services:
       DISCORD_TOKEN: "${DISCORD_TOKEN}"
 
       # Option B: Web login (if no bot token)
-      # DISCORD_EMAIL: "${DISCORD_EMAIL}"
-      # DISCORD_PASSWORD: "${DISCORD_PASSWORD}"
+      DISCORD_EMAIL: "${DISCORD_EMAIL}"
+      DISCORD_PASSWORD: "${DISCORD_PASSWORD}"
 
       # ── X.com / Grok ─────────────────────────────────────────
       X_USERNAME: "${X_USERNAME}"
