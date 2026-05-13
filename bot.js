@@ -52,11 +52,18 @@ if (!DEEPSEEK_API_KEY) console.warn('⚠️  DEEPSEEK_API_KEY not set — text r
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STATE
+//  Discord and Grok now run in SEPARATE browser instances:
+//    discordBrowser  → headed  (visible in noVNC, needs WebRTC + shared mem)
+//    grokBrowser     → headless (no display, saves ~500MB RAM + GPU pressure)
 // ─────────────────────────────────────────────────────────────────────────────
-let browser       = null;
-let browserCtx    = null;
-let grokPage      = null;   // LAZY — only opened on /ask, auto-closes after idle
-let discordPage   = null;
+let discordBrowser    = null;
+let discordBrowserCtx = null;
+let discordPage       = null;
+
+let grokBrowser       = null;
+let grokBrowserCtx    = null;
+let grokPage          = null;
+
 let isBusy        = false;
 let grokIdleTimer = null;
 const conversationHistory = new Map();
@@ -66,8 +73,6 @@ function log(emoji, ...args) { console.log(new Date().toISOString(), emoji, ...a
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  RESOURCE BLOCKING
-//  Blocks images, media, fonts, and tracking scripts on all pages.
-//  Discord and Grok work fine without them. Saves ~200-400MB per tab.
 // ─────────────────────────────────────────────────────────────────────────────
 const BLOCKED_TYPES = new Set(['image', 'media', 'font', 'ping']);
 const BLOCKED_HOSTS = [
@@ -210,102 +215,128 @@ function resetConversation(channelId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BROWSER LAUNCH
+//  COMMON BROWSER ARGS (shared baseline for both instances)
 // ─────────────────────────────────────────────────────────────────────────────
-async function launchBrowser() {
-  if (browser) {
-    try { browser.contexts(); }
-    catch (_) { cleanupBrowser(); }
+const COMMON_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-blink-features=AutomationControlled',
+  '--disable-component-update',
+  '--disable-background-networking',
+  '--disable-extensions',
+  '--disable-sync',
+  '--disable-translate',
+  '--disable-default-apps',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-ipc-flooding-protection',
+  '--no-first-run',
+  '--disable-hang-monitor',
+  '--js-flags=--max-old-space-size=1536',
+];
+
+const COMMON_INIT_SCRIPT = () => {
+  Object.defineProperty(navigator, 'webdriver',  { get: () => undefined });
+  Object.defineProperty(navigator, 'languages',  { get: () => ['en-US', 'en'] });
+  Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3] });
+  const orig = navigator.permissions.query.bind(navigator.permissions);
+  navigator.permissions.query = p =>
+    ['microphone', 'camera', 'notifications', 'clipboard-read'].includes(p?.name)
+      ? Promise.resolve({ state: 'granted', onchange: null })
+      : orig(p);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DISCORD BROWSER — headed, full WebRTC + shared memory for voice
+// ─────────────────────────────────────────────────────────────────────────────
+async function launchDiscordBrowser() {
+  if (discordBrowser) {
+    try { discordBrowser.contexts(); return discordBrowserCtx; }
+    catch (_) { cleanupDiscordBrowser(); }
   }
-  if (browser) return browserCtx;
-  log('🌐', 'Launching browser...');
 
-  browser = await chromium.launch({
+  log('🌐', 'Launching Discord browser (headed)...');
+  discordBrowser = await chromium.launch({
     headless: false,
+    executablePath: CHROMIUM_PATH,
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-
-      // ── DO NOT add --disable-dev-shm-usage ───────────────────────────────
-      // shm_size=4gb is set in docker-compose. Discord voice needs shared mem.
-
-      '--disable-blink-features=AutomationControlled',
-
-      // ── GPU: swiftshader (software GL that WebRTC still accepts) ──────────
-      // DO NOT use --disable-gpu + --disable-software-rasterizer together —
-      // that kills WebRTC's media pipeline and causes the Aw Snap crash.
+      ...COMMON_ARGS,
       '--disable-gpu-sandbox',
       '--use-gl=swiftshader',
       '--ignore-gpu-blocklist',
-
-      // ── Media ─────────────────────────────────────────────────────────────
-      // DO NOT add --use-fake-ui-for-media-stream:
-      //   it replaces your PulseAudio VirtualMic with a silent fake device,
-      //   causing Discord Error 3002. Mic permissions are granted via context.
+      // Audio: do NOT use --use-fake-ui-for-media-stream
+      // PulseAudio VirtualMic is the real default source
       '--autoplay-policy=no-user-gesture-required',
       '--disable-web-security',
       '--enable-usermedia-screen-capturing',
       '--allow-http-screen-capture',
-
-      // ── Memory ────────────────────────────────────────────────────────────
-      '--js-flags=--max-old-space-size=2048',
       '--memory-pressure-off',
-      '--disable-component-update',
-
-      // ── Reduce unnecessary processes ──────────────────────────────────────
-      '--disable-background-networking',
-      '--disable-extensions',
-      '--disable-sync',
-      '--disable-translate',
-      '--disable-default-apps',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-ipc-flooding-protection',
-      '--no-first-run',
-      '--disable-hang-monitor',
-
       '--window-size=1920,1080',
       '--start-maximized',
     ],
-    executablePath: CHROMIUM_PATH,
   });
 
-  browserCtx = await browser.newContext({
+  discordBrowserCtx = await discordBrowser.newContext({
     viewport: { width: 1920, height: 1080 },
-    // Grant mic/camera at context level — no dialog popup.
-    // The actual audio device used will be PulseAudio's default (VirtualMic)
-    // because we did NOT use --use-fake-ui-for-media-stream.
     permissions: ['microphone', 'camera', 'notifications', 'clipboard-read'],
     extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
     userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
 
-  await browserCtx.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver',  { get: () => undefined });
-    Object.defineProperty(navigator, 'languages',  { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3] });
-    const orig = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = p =>
-      ['microphone', 'camera', 'notifications', 'clipboard-read'].includes(p?.name)
-        ? Promise.resolve({ state: 'granted', onchange: null })
-        : orig(p);
-  });
+  await discordBrowserCtx.addInitScript(COMMON_INIT_SCRIPT);
 
-  log('✅', 'Browser launched');
-  return browserCtx;
+  log('✅', 'Discord browser launched (headed)');
+  return discordBrowserCtx;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GROK TAB — LAZY
-//  Not opened on startup. Only opens when /ask is used.
-//  Auto-closes after 5 minutes idle to free memory for Discord voice.
+//  GROK BROWSER — headless, no GPU, lighter footprint
+//  Audio still flows via PulseAudio at the OS level — headless doesn't block it.
+//  Grok voice mode works because the browser connects to PulseAudio's default
+//  sink (DiscordSink) regardless of headless/headed state.
+// ─────────────────────────────────────────────────────────────────────────────
+async function launchGrokBrowser() {
+  if (grokBrowser) {
+    try { grokBrowser.contexts(); return grokBrowserCtx; }
+    catch (_) { cleanupGrokBrowser(); }
+  }
+
+  log('🤖', 'Launching Grok browser (headless)...');
+  grokBrowser = await chromium.launch({
+    headless: true,           // ← headless: saves GPU memory + no display contention
+    executablePath: CHROMIUM_PATH,
+    args: [
+      ...COMMON_ARGS,
+      '--disable-gpu',                        // safe in headless
+      '--disable-software-rasterizer',        // safe — no rendering needed
+      '--autoplay-policy=no-user-gesture-required',
+      '--enable-usermedia-screen-capturing',  // still needed for mic/speaker
+      // Audio output still routed to PulseAudio default sink (DiscordSink)
+      '--alsa-output-device=pulse',
+    ],
+  });
+
+  grokBrowserCtx = await grokBrowser.newContext({
+    viewport: { width: 1280, height: 720 },   // smaller — nothing to display
+    permissions: ['microphone', 'camera', 'notifications'],
+    extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  });
+
+  await grokBrowserCtx.addInitScript(COMMON_INIT_SCRIPT);
+
+  log('✅', 'Grok browser launched (headless)');
+  return grokBrowserCtx;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GROK TAB — LAZY + HEADLESS
 // ─────────────────────────────────────────────────────────────────────────────
 const GROK_IDLE_MS = 5 * 60 * 1000;
 
 async function ensureGrokTab() {
   if (!hasGrokAuth) { log('⚠️', 'No GROK_COOKIES — cannot open Grok'); return false; }
 
-  // Check if existing page is still alive
   if (grokPage) {
     try { await grokPage.title(); }
     catch (_) { grokPage = null; }
@@ -313,8 +344,8 @@ async function ensureGrokTab() {
 
   if (grokPage) { rescheduleGrokIdle(); return true; }
 
-  const ctx = await launchBrowser();
-  log('🤖', 'Opening Grok tab (lazy)...');
+  const ctx = await launchGrokBrowser();
+  log('🤖', 'Opening Grok tab (headless, lazy)...');
   grokPage = await ctx.newPage();
   grokPage.on('dialog', d => d.dismiss().catch(() => {}));
   grokPage.on('crash', () => {
@@ -336,7 +367,7 @@ async function ensureGrokTab() {
 
   const isLoggedIn = !grokPage.url().includes('login') && !grokPage.url().includes('signin');
   if (isLoggedIn) {
-    log('✅', 'Grok tab ready');
+    log('✅', 'Grok tab ready (headless)');
     await activateGrokVoice();
     rescheduleGrokIdle();
     return true;
@@ -344,6 +375,7 @@ async function ensureGrokTab() {
     log('⚠️', 'Grok login failed — check GROK_COOKIES');
     await grokPage.close().catch(() => {});
     grokPage = null;
+    cleanupGrokBrowser();
     return false;
   }
 }
@@ -351,8 +383,9 @@ async function ensureGrokTab() {
 function rescheduleGrokIdle() {
   if (grokIdleTimer) clearTimeout(grokIdleTimer);
   grokIdleTimer = setTimeout(() => {
-    log('💤', 'Closing Grok tab after inactivity (freeing memory for Discord voice)');
+    log('💤', 'Closing Grok tab + browser after inactivity');
     if (grokPage) { grokPage.close().catch(() => {}); grokPage = null; }
+    cleanupGrokBrowser();
     grokIdleTimer = null;
   }, GROK_IDLE_MS);
 }
@@ -360,7 +393,8 @@ function rescheduleGrokIdle() {
 function closeGrokTab() {
   if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
   if (grokPage) { grokPage.close().catch(() => {}); grokPage = null; }
-  log('🗑️', 'Grok tab closed');
+  cleanupGrokBrowser();
+  log('🗑️', 'Grok tab + browser closed');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,14 +405,13 @@ async function openDiscordTab(ctx) {
   discordPage = await ctx.newPage();
   discordPage.on('dialog', d => d.dismiss().catch(() => {}));
 
-  // Block images/media/fonts — Discord renders fine without them, saves ~200MB
   await blockHeavyResources(discordPage);
 
   discordPage.on('crash', () => {
     log('💥', 'Discord page crashed — recovering in 5s...');
     discordPage = null;
     setTimeout(async () => {
-      const c = await launchBrowser().catch(() => null);
+      const c = await launchDiscordBrowser().catch(() => null);
       if (c) openDiscordTab(c).catch(err => log('❌', 'Recovery failed:', err.message));
     }, 5000);
   });
@@ -507,15 +540,11 @@ async function loginToDiscordWeb(page) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DISCORD MIC SETTINGS FIX
-//  Opens Discord User Settings → Voice & Video and sets Input Device to Default.
-//  "Default" maps to VirtualMic via PulseAudio (we set it as default source).
-//  Called automatically 4 seconds after joining a voice channel.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fixDiscordMicSettings() {
   if (!discordPage) return;
   log('🎤', 'Fixing Discord mic settings...');
   try {
-    // Open User Settings
     const gearBtn = discordPage.locator('[aria-label="User Settings"]').first();
     if (await gearBtn.count() === 0) {
       log('⚠️', 'Settings gear not found — skipping mic fix'); return;
@@ -523,7 +552,6 @@ async function fixDiscordMicSettings() {
     await gearBtn.click();
     await sleep(1500);
 
-    // Click Voice & Video in the settings sidebar
     const voiceNav = discordPage.locator('[class*="item"]:has-text("Voice & Video")').first();
     if (await voiceNav.count() === 0) {
       await discordPage.keyboard.press('Escape');
@@ -532,7 +560,6 @@ async function fixDiscordMicSettings() {
     await voiceNav.click();
     await sleep(1000);
 
-    // Set Input Device to Default (maps to VirtualMic via PulseAudio default source)
     const inputWrapper = discordPage.locator(
       '[class*="deviceSelectWrapper"], [class*="inputDevice"], [class*="inputDevices"]'
     ).first();
@@ -563,7 +590,6 @@ async function joinVoiceChannelById(guildId, channelId) {
   if (!discordPage) { log('❌', 'Discord tab not open'); return false; }
   log('🔊', `Joining VC ${channelId} in guild ${guildId}`);
   try {
-    // Step 1: Navigate to guild first if we're not already there (lighter than jumping to channel directly)
     const currentUrl = discordPage.url();
     if (!currentUrl.includes(guildId)) {
       await discordPage.goto(
@@ -573,7 +599,6 @@ async function joinVoiceChannelById(guildId, channelId) {
       await sleep(2000);
     }
 
-    // Step 2: Try clicking the VC link in the sidebar (less aggressive than full page navigation)
     const vcLink = discordPage.locator(
       `a[href*="/${channelId}"], [data-list-item-id*="${channelId}"]`
     ).first();
@@ -583,7 +608,6 @@ async function joinVoiceChannelById(guildId, channelId) {
       await vcLink.click();
       await sleep(2000);
     } else {
-      // Fallback: direct navigation
       log('🔗', 'VC not in sidebar — navigating directly...');
       await discordPage.goto(
         `https://discord.com/channels/${guildId}/${channelId}`,
@@ -592,7 +616,6 @@ async function joinVoiceChannelById(guildId, channelId) {
       await sleep(2000);
     }
 
-    // Step 3: Click "Join Voice" if the button appears
     const joinBtn = discordPage.locator(
       'button:has-text("Join Voice"), button:has-text("Join")'
     ).first();
@@ -601,15 +624,11 @@ async function joinVoiceChannelById(guildId, channelId) {
       await sleep(2000);
     }
 
-    // Step 4: Allow mic if browser shows a prompt
     const allowBtn = discordPage.locator('button:has-text("Allow"), button:has-text("Grant Access")').first();
     if (await allowBtn.count() > 0) await allowBtn.click();
 
     log('✅', `Milo joined VC ${channelId}`);
-
-    // Step 5: Fix mic settings after Discord loads voice
     setTimeout(() => fixDiscordMicSettings().catch(() => {}), 4000);
-
     return true;
   } catch (err) {
     log('❌', 'joinVoiceChannelById error:', err.message);
@@ -651,7 +670,7 @@ async function activateGrokVoice() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEND TO GROK (opens tab lazily if needed)
+//  SEND TO GROK
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendToGrok(text) {
   if (isBusy) return false;
@@ -693,21 +712,45 @@ async function sendToGrok(text) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AUTO-START  (Discord tab only — Grok tab is lazy)
+//  SCREENSHOT GROK  (headless → Buffer → Discord attachment)
+// ─────────────────────────────────────────────────────────────────────────────
+async function screenshotGrok() {
+  log('📸', 'Taking Grok screenshot...');
+  try {
+    const ready = await ensureGrokTab();
+    if (!ready) return { ok: false, error: 'Grok tab unavailable — check GROK_COOKIES' };
+
+    // Wait briefly for any in-progress render to settle
+    await sleep(800);
+
+    const buf = await grokPage.screenshot({
+      type:     'png',
+      fullPage: false,      // viewport only — keeps file small
+      animations: 'disabled',
+    });
+
+    rescheduleGrokIdle();
+    log('✅', `Screenshot taken (${(buf.length / 1024).toFixed(0)} KB)`);
+    return { ok: true, buf };
+  } catch (err) {
+    log('❌', 'screenshotGrok error:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AUTO-START  (Discord only on boot — Grok is lazy)
 // ─────────────────────────────────────────────────────────────────────────────
 async function autoStart() {
   log('🚀', 'Auto-starting browser session...');
   try {
-    const ctx = await launchBrowser();
-
-    // Only Discord tab on startup — Grok opens on first /ask.
-    // This keeps memory free for Discord voice/WebRTC.
+    const ctx = await launchDiscordBrowser();
     await openDiscordTab(ctx);
 
     log('🎉', '══════════════════════════════════════════════');
     log('🎉', `  ${PERSONA.name} is LIVE!`);
     log('🎉', '  Tag @Milo in chat or join a VC and she follows');
-    log('🎉', '  Grok tab is lazy — opens on first /ask, closes after 5min idle');
+    log('🎉', '  Grok → headless browser, opens on first /ask, closes after 5min idle');
     log('🎉', '  noVNC → http://YOUR_HOST:6080/vnc.html?autoconnect=true&resize=scale');
     log('🎉', '══════════════════════════════════════════════');
   } catch (err) {
@@ -726,7 +769,7 @@ async function startDiscordBot() {
     return;
   }
 
-  const { Client, GatewayIntentBits, MessageFlags } = require('discord.js');
+  const { Client, GatewayIntentBits, MessageFlags, AttachmentBuilder } = require('discord.js');
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
@@ -744,6 +787,7 @@ async function startDiscordBot() {
     { name: 'reset',     description: '🔄 Reset Milo\'s conversation memory' },
     { name: 'status',    description: '📊 Check Milo\'s status' },
     { name: 'closegrok', description: '🗑️ Close Grok tab to free memory' },
+    { name: 'view',      description: '📸 Screenshot the Grok tab and send it here' },
   ];
 
   client.once('ready', async () => {
@@ -812,7 +856,7 @@ async function startDiscordBot() {
 
     if (cmd === 'restart') {
       await interaction.reply('🔄 Restarting...');
-      cleanupBrowser();
+      cleanupAll();
       await sleep(2000);
       try {
         await autoStart();
@@ -823,9 +867,10 @@ async function startDiscordBot() {
     }
 
     if (cmd === 'stop') {
-      if (!browser) return interaction.reply({ content: '⚠️ Nothing running.', flags: MessageFlags.Ephemeral });
+      if (!discordBrowser && !grokBrowser)
+        return interaction.reply({ content: '⚠️ Nothing running.', flags: MessageFlags.Ephemeral });
       await interaction.reply('🛑 Shutting down...');
-      cleanupBrowser();
+      cleanupAll();
       await interaction.editReply('✅ Stopped.');
     }
 
@@ -851,8 +896,27 @@ async function startDiscordBot() {
     if (cmd === 'closegrok') {
       closeGrokTab();
       await interaction.reply({
-        content: '🗑️ Grok tab closed (memory freed). Will re-open on next /ask.',
+        content: '🗑️ Grok tab + browser closed (memory freed). Will re-open on next /ask.',
         flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    if (cmd === 'view') {
+      if (!hasGrokAuth)
+        return interaction.reply({ content: '❌ GROK_COOKIES not set — Grok tab unavailable', flags: MessageFlags.Ephemeral });
+
+      await interaction.deferReply();           // gives us 15 min instead of 3s
+      const { ok, buf, error } = await screenshotGrok();
+
+      if (!ok) {
+        return interaction.editReply(`❌ Screenshot failed: ${error}`);
+      }
+
+      const attachment = new AttachmentBuilder(buf, { name: 'grok.png' });
+      const url = grokPage ? grokPage.url() : GROK_URL;
+      await interaction.editReply({
+        content: `📸 **Grok** — \`${url}\``,
+        files: [attachment],
       });
     }
 
@@ -862,13 +926,14 @@ async function startDiscordBot() {
       const mm = Math.floor((uptime % 3600) / 60);
       const ss = Math.floor(uptime % 60);
       const lines = [
-        `🤖 **${PERSONA.name}** — ${browser ? '🟢 Running' : '🔴 Stopped'}`,
-        `🌐 Browser  : ${browser     ? '✅ Open' : '❌ Closed'}`,
-        `🎙️ Grok tab : ${grokPage    ? '✅ Open (auto-closes in 5min idle)' : '💤 Closed (opens on /ask)'}`,
-        `💬 Discord  : ${discordPage ? '✅ Open' : '❌ Closed'}`,
-        `🧠 DeepSeek : ${DEEPSEEK_API_KEY ? '✅ Enabled' : '❌ Disabled'}`,
-        `👑 Owner    : ${OWNER_ID}`,
-        `⏱️ Uptime   : ${hh}h ${mm}m ${ss}s`,
+        `🤖 **${PERSONA.name}** — ${discordBrowser ? '🟢 Running' : '🔴 Stopped'}`,
+        `🌐 Discord browser : ${discordBrowser ? '✅ Headed (visible in noVNC)' : '❌ Closed'}`,
+        `🤖 Grok browser    : ${grokBrowser    ? '✅ Headless (active)' : '💤 Closed (opens on /ask)'}`,
+        `🎙️ Grok tab        : ${grokPage       ? '✅ Open' : '💤 Closed (auto-closes after 5min idle)'}`,
+        `💬 Discord tab     : ${discordPage    ? '✅ Open' : '❌ Closed'}`,
+        `🧠 DeepSeek        : ${DEEPSEEK_API_KEY ? '✅ Enabled' : '❌ Disabled'}`,
+        `👑 Owner           : ${OWNER_ID}`,
+        `⏱️ Uptime          : ${hh}h ${mm}m ${ss}s`,
       ];
       await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
     }
@@ -879,7 +944,7 @@ async function startDiscordBot() {
     if (!interaction.isModalSubmit()) return;
     if (interaction.customId === 'askModal') {
       const text = interaction.fields.getTextInputValue('askText');
-      await interaction.reply('⏳ Opening Grok and sending...');
+      await interaction.reply('⏳ Opening Grok (headless) and sending...');
       const ok = await sendToGrok(text);
       await interaction.editReply(ok ? '🔊 Grok is responding!' : '❌ Failed to reach Grok.');
     }
@@ -891,18 +956,30 @@ async function startDiscordBot() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  CLEANUP
 // ─────────────────────────────────────────────────────────────────────────────
-function cleanupBrowser() {
-  isBusy = false;
-  if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
-  if (browser) { browser.close().catch(() => {}); browser = null; }
-  browserCtx  = null;
-  grokPage    = null;
-  discordPage = null;
-  log('🧹', 'Browser resources cleaned up');
+function cleanupDiscordBrowser() {
+  if (discordBrowser) { discordBrowser.close().catch(() => {}); discordBrowser = null; }
+  discordBrowserCtx = null;
+  discordPage       = null;
+  log('🧹', 'Discord browser cleaned up');
 }
 
-process.on('SIGINT',  () => { cleanupBrowser(); process.exit(0); });
-process.on('SIGTERM', () => { cleanupBrowser(); process.exit(0); });
+function cleanupGrokBrowser() {
+  if (grokBrowser) { grokBrowser.close().catch(() => {}); grokBrowser = null; }
+  grokBrowserCtx = null;
+  grokPage       = null;
+  log('🧹', 'Grok browser cleaned up');
+}
+
+function cleanupAll() {
+  isBusy = false;
+  if (grokIdleTimer) { clearTimeout(grokIdleTimer); grokIdleTimer = null; }
+  cleanupDiscordBrowser();
+  cleanupGrokBrowser();
+  log('🧹', 'All browser resources cleaned up');
+}
+
+process.on('SIGINT',  () => { cleanupAll(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupAll(); process.exit(0); });
 process.on('unhandledRejection', err => log('❌', 'unhandledRejection:', err));
 process.on('uncaughtException',  err => log('❌', 'uncaughtException:',  err));
 
