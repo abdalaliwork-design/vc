@@ -3,7 +3,7 @@ process.env.DISCORDJS_NO_LAZY_LOAD = 'true';
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, MessageFlags } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -70,10 +70,10 @@ let currentDecoder = null;
 let activeAudioStream = null;
 let isUserSpeaking = false;
 let speakingEndTimer = null;
-let currentSpeakerId = null;
 let currentGuild = null;
 
 const SILENCE_FRAME = Buffer.alloc(960 * 2 * 2);
+const speakerSessions = new Map();
 
 const commands = [
   { name: 'start', description: 'يبدأ جلسة Grok ويربط الصوت' },
@@ -120,31 +120,6 @@ async function updateVoiceStatus(speaking) {
     }
   } catch (e) {
     console.error('❌ updateVoiceStatus:', e.message);
-  }
-}
-
-function cleanupInputStream() {
-  isUserSpeaking = false;
-  currentSpeakerId = null;
-
-  if (speakingEndTimer) {
-    clearTimeout(speakingEndTimer);
-    speakingEndTimer = null;
-  }
-
-  if (currentDecoder) {
-    try {
-      currentDecoder.destroy();
-    } catch {}
-    currentDecoder = null;
-  }
-
-  if (activeAudioStream) {
-    try {
-      activeAudioStream.removeAllListeners();
-      activeAudioStream.destroy();
-    } catch {}
-    activeAudioStream = null;
   }
 }
 
@@ -339,91 +314,113 @@ async function sendTextToGrok(text) {
   }
 }
 
-function startUserAudioCapture(receiver, userId) {
-  if (activeAudioStream || currentDecoder) return;
+function cleanupSpeakerSession(userId) {
+  const session = speakerSessions.get(userId);
+  if (!session) return;
 
-  ensureInputPipeline();
-  isUserSpeaking = true;
-  currentSpeakerId = userId;
+  try {
+    session.stream?.removeAllListeners();
+    session.stream?.destroy();
+  } catch {}
 
-  if (speakingEndTimer) {
-    clearTimeout(speakingEndTimer);
-    speakingEndTimer = null;
+  try {
+    session.decoder?.removeAllListeners();
+    session.decoder?.destroy();
+  } catch {}
+
+  speakerSessions.delete(userId);
+
+  if (speakerSessions.size === 0) {
+    isUserSpeaking = false;
+    currentDecoder = null;
+    activeAudioStream = null;
   }
+}
 
+function startSpeakerSession(receiver, userId) {
+  if (speakerSessions.has(userId)) return;
+  ensureInputPipeline();
+
+  isUserSpeaking = true;
+  currentDecoder = true;
   const label = getSpeakerLabel(userId);
+
   postVoiceChat(`🎤 **${label}** user talk`);
   updateVoiceStatus(true);
 
-  currentDecoder = new prism.opus.Decoder({
+  const decoder = new prism.opus.Decoder({
     rate: 48000,
     channels: 2,
     frameSize: 960,
   });
 
-  currentDecoder.on('error', (err) => {
-    console.error('❌ OpusDecoder:', err.message);
+  decoder.on('error', (err) => {
+    console.error(`❌ OpusDecoder(${userId}):`, err.message);
   });
 
-  activeAudioStream = receiver.subscribe(userId, {
+  const stream = receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
   });
 
-  activeAudioStream.on('error', async (err) => {
-    console.error('❌ audioStream error:', err.message);
-    cleanupInputStream();
-    await updateVoiceStatus(false);
+  stream.on('error', async (err) => {
+    console.error(`❌ audioStream(${userId}) error:`, err.message);
+    cleanupSpeakerSession(userId);
+    if (speakerSessions.size === 0) {
+      await updateVoiceStatus(false);
+    }
   });
 
-  activeAudioStream.on('end', async () => {
-    const endedUserId = currentSpeakerId;
-    cleanupInputStream();
-    const endedLabel = getSpeakerLabel(endedUserId || userId);
+  stream.on('end', async () => {
+    cleanupSpeakerSession(userId);
+    const endedLabel = getSpeakerLabel(userId);
     await postVoiceChat(`🔇 **${endedLabel}** user stopped`);
-    await updateVoiceStatus(false);
+    if (speakerSessions.size === 0) {
+      await updateVoiceStatus(false);
+    }
   });
 
-  activeAudioStream.pipe(currentDecoder).pipe(ffmpegIn.stdin, { end: false });
+  decoder.on('data', (chunk) => {
+    if (ffmpegIn?.stdin?.writable) {
+      const ok = ffmpegIn.stdin.write(chunk);
+      if (!ok) {
+        stream.pause?.();
+        ffmpegIn.stdin.once('drain', () => {
+          stream.resume?.();
+        });
+      }
+    }
+  });
+
+  stream.pipe(decoder);
+
+  speakerSessions.set(userId, { stream, decoder });
+  activeAudioStream = stream;
+  currentDecoder = decoder;
 }
 
 function setupVoiceInput(receiver) {
   console.log('🎧 إعداد استقبال الصوت لجميع المستخدمين في القناة...');
 
   receiver.speaking.on('start', (userId) => {
-    if (currentSpeakerId && currentSpeakerId !== userId) {
-      return;
-    }
-
+    if (userId === client.user?.id) return;
     if (silenceTimeout) {
       clearTimeout(silenceTimeout);
       silenceTimeout = null;
     }
-
-    if (isUserSpeaking || activeAudioStream) return;
-
+    if (speakerSessions.has(userId)) return;
     console.log(`🎤 [SPEAKING] user ${userId} started`);
-    startUserAudioCapture(receiver, userId);
+    startSpeakerSession(receiver, userId);
   });
 
   receiver.speaking.on('end', (userId) => {
-    if (!currentSpeakerId || currentSpeakerId !== userId) return;
-
-    console.log(`🎤 [STOPPED] user ${userId} stopped`);
-
-    if (speakingEndTimer) clearTimeout(speakingEndTimer);
-    speakingEndTimer = setTimeout(async () => {
-      if (!isUserSpeaking) return;
-      isUserSpeaking = false;
-      const label = getSpeakerLabel(userId);
-      await postVoiceChat(`🔇 **${label}** user stopped`);
-      await updateVoiceStatus(false);
-    }, 500);
+    if (userId === client.user?.id) return;
+    console.log(`🎤 [STOPPED] user ${userId} ended`);
   });
 
   if (!inputKeepAliveInterval) {
     inputKeepAliveInterval = setInterval(() => {
       if (!ffmpegIn?.stdin?.writable) return;
-      if (!isUserSpeaking) {
+      if (speakerSessions.size === 0) {
         ffmpegIn.stdin.write(SILENCE_FRAME);
       }
     }, 20);
@@ -720,9 +717,7 @@ client.on('messageCreate', async (message) => {
   const text = message.content.trim();
   if (!text || text.startsWith('/')) return;
 
-  if (ALLOWED_USER_ID && message.author.id !== ALLOWED_USER_ID) {
-    return;
-  }
+  if (ALLOWED_USER_ID && message.author.id !== ALLOWED_USER_ID) return;
 
   console.log(`💬 [TEXT→GROK] "${text}"`);
 
@@ -741,16 +736,25 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   if (ALLOWED_USER_ID && interaction.user.id !== ALLOWED_USER_ID) {
-    return interaction.reply({ content: '❌ ليس لديك صلاحية.', ephemeral: true });
+    return interaction.reply({
+      content: '❌ ليس لديك صلاحية.',
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   if (interaction.commandName === 'start') {
     const voiceChannel = interaction.member?.voice?.channel;
     if (!voiceChannel) {
-      return interaction.reply({ content: '❌ انضم لقناة صوتية أولاً!', ephemeral: true });
+      return interaction.reply({
+        content: '❌ انضم لقناة صوتية أولاً!',
+        flags: MessageFlags.Ephemeral,
+      });
     }
     if (browser) {
-      return interaction.reply({ content: '⚠️ جلسة تعمل بالفعل!', ephemeral: true });
+      return interaction.reply({
+        content: '⚠️ جلسة تعمل بالفعل!',
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     await interaction.reply('🔄 جاري التهيئة...');
@@ -760,6 +764,7 @@ client.on('interactionCreate', async (interaction) => {
 
     try {
       initPlayer();
+      ensureInputPipeline();
 
       connection = joinVoiceChannel({
         channelId: voiceChannel.id,
@@ -777,7 +782,7 @@ client.on('interactionCreate', async (interaction) => {
         console.error('❌ Voice connection error:', err);
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+      await entersState(connection, VoiceConnectionStatus.Ready, 120000);
       console.log('✅ Voice connection READY');
 
       connection.subscribe(player);
@@ -828,7 +833,10 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'stop') {
     if (!browser) {
-      return interaction.reply({ content: '⚠️ لا توجد جلسة نشطة.', ephemeral: true });
+      return interaction.reply({
+        content: '⚠️ لا توجد جلسة نشطة.',
+        flags: MessageFlags.Ephemeral,
+      });
     }
     await interaction.reply('🛑 جاري الإيقاف...');
     cleanupAll();
@@ -860,13 +868,17 @@ function cleanupAll() {
   voiceInputReady = false;
   isSendingToGrok = false;
   isUserSpeaking = false;
-  currentSpeakerId = null;
 
-  cleanupInputStream();
+  for (const userId of speakerSessions.keys()) {
+    cleanupSpeakerSession(userId);
+  }
+  speakerSessions.clear();
 
-  if (cdpSession) {
-    cdpSession.detach().catch(() => {});
-    cdpSession = null;
+  if (cdepSession) {
+    try {
+      cdepSession.detach().catch(() => {});
+    } catch {}
+    cdepSession = null;
   }
 
   if (ffmpegOut) {
