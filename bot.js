@@ -296,14 +296,13 @@ async function openDiscordTab(ctx) {
   // ── Method 1: MILO_TOKEN — inject directly into localStorage (best, bypasses login page) ──
   if (MILO_TOKEN) {
     log('🔑', 'Injecting Milo user token into Discord localStorage...');
-    // Must wait for 'load' (not just domcontentloaded) so window.localStorage is defined
-    await discordPage.goto('https://discord.com', { waitUntil: 'load', timeout: 30000 });
-    await discordPage.evaluate(token => {
-      window.localStorage.setItem('token', `"${token}"`);
+    // addInitScript runs BEFORE any page JS, on every navigation in this page
+    await discordPage.addInitScript(token => {
+      try { window.localStorage.setItem('token', JSON.stringify(token)); } catch (_) {}
     }, MILO_TOKEN);
-    // Now navigate to /app — Discord reads the token and loads without a login page
-    await discordPage.goto('https://discord.com/app', { waitUntil: 'load', timeout: 60000 });
-    await sleep(3000);
+    // Go straight to /app — the init script sets the token before Discord's code runs
+    await discordPage.goto('https://discord.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(4000);
 
     if (!discordPage.url().includes('login')) {
       log('✅', 'Discord logged in via MILO_TOKEN');
