@@ -1,71 +1,60 @@
-FROM node:18-bullseye
+FROM node:20-bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    python3 \
-    make \
-    g++ \
-    libopus0 \
-    libopus-dev \
-    xvfb \
-    pulseaudio \
-    pulseaudio-utils \
-    ffmpeg \
-    espeak \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxi6 \
-    libxtst6 \
-    libcups2 \
-    libxss1 \
-    libxrandr2 \
-    libasound2 \
-    libgtk-3-0 \
-    libgbm1 \
-    dbus-x11 \
-    sudo \
-    x11vnc \
-    novnc \
-    websockify \
-    net-tools \
-    ca-certificates \
-    wget \
-    curl \
-    git \
+LABEL maintainer="grok-discord-bridge"
+LABEL description="Grok ↔ Discord voice bridge via browser automation + PulseAudio"
+
+# ── System dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Display
+    xvfb x11vnc \
+    # Audio
+    pulseaudio pulseaudio-utils \
+    # Chromium
+    chromium \
+    # noVNC / websockify
+    novnc websockify \
+    # Utilities
+    curl wget ca-certificates dumb-init \
+    # For Playwright browser deps
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+    libxfixes3 libxrandr2 libgbm1 libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
-RUN usermod -aG audio node
+# ── noVNC setup ───────────────────────────────────────────────────────────────
+RUN ln -sf /usr/share/novnc/utils/novnc_proxy /usr/bin/novnc_proxy 2>/dev/null || true
 
-ENV XDG_RUNTIME_DIR=/tmp/runtime-node
-RUN mkdir -p /tmp/runtime-node && chown -R node:node /tmp/runtime-node && chmod 700 /tmp/runtime-node
-
+# ── App setup ─────────────────────────────────────────────────────────────────
 WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev
 
-COPY package*.json ./
-RUN npm install --legacy-peer-deps
+# Install Playwright browsers (uses system chromium via env var)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV CHROMIUM_PATH=/usr/bin/chromium
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npx playwright install chromium
-RUN npx playwright install-deps chromium
-RUN chmod -R 777 /ms-playwright
+COPY bot.js ./
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-COPY . .
-RUN chmod +x entrypoint.sh && chown -R node:node /app
+# ── PulseAudio config ─────────────────────────────────────────────────────────
+RUN mkdir -p /root/.config/pulse && cat > /root/.config/pulse/daemon.conf <<EOF
+daemonize = no
+allow-module-loading = yes
+allow-exit = no
+use-pid-file = yes
+exit-idle-time = -1
+flat-volumes = no
+default-sample-format = s16le
+default-sample-rate = 48000
+default-sample-channels = 2
+EOF
 
-EXPOSE 6080
-EXPOSE 5900
+# ── Ports ─────────────────────────────────────────────────────────────────────
+# 6080 = noVNC web UI
+# 5900 = raw VNC
+EXPOSE 6080 5900
 
-ENV DISPLAY=:99
-ENV PULSE_SINK=DiscordSink
-ENV PULSE_SOURCE=VirtualMic
-ENV PULSE_LATENCY_MSEC=120
-ENV NODE_OPTIONS=--dns-result-order=ipv4first
-
-USER node
-ENTRYPOINT ["./entrypoint.sh"]
+# ── Run ───────────────────────────────────────────────────────────────────────
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["/app/entrypoint.sh"]
