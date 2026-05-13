@@ -1,14 +1,12 @@
-```dockerfile
 FROM node:18-bullseye
 
-# ─────────────────────────────────────────────────────────────
-# System dependencies
-# ─────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3 \
     make \
     g++ \
+    libopus0 \
+    libopus-dev \
     xvfb \
     pulseaudio \
     pulseaudio-utils \
@@ -41,85 +39,32 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# ─────────────────────────────────────────────────────────────
-# X11 runtime
-# ─────────────────────────────────────────────────────────────
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
-
-# ─────────────────────────────────────────────────────────────
-# Audio permissions
-# ─────────────────────────────────────────────────────────────
 RUN usermod -aG audio node
 
-# ─────────────────────────────────────────────────────────────
-# PulseAudio runtime
-# ─────────────────────────────────────────────────────────────
 ENV XDG_RUNTIME_DIR=/tmp/runtime-node
+RUN mkdir -p /tmp/runtime-node && chown -R node:node /tmp/runtime-node && chmod 700 /tmp/runtime-node
 
-RUN mkdir -p /tmp/runtime-node \
-    && chown -R node:node /tmp/runtime-node \
-    && chmod 700 /tmp/runtime-node
-
-# ─────────────────────────────────────────────────────────────
-# Working directory
-# ─────────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ─────────────────────────────────────────────────────────────
-# Package files
-# ─────────────────────────────────────────────────────────────
 COPY package*.json ./
-
-# ─────────────────────────────────────────────────────────────
-# Install node modules
-# ─────────────────────────────────────────────────────────────
 RUN npm install --legacy-peer-deps
 
-# ─────────────────────────────────────────────────────────────
-# Playwright browsers
-# ─────────────────────────────────────────────────────────────
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
 RUN npx playwright install chromium
 RUN npx playwright install-deps chromium
-
 RUN chmod -R 777 /ms-playwright
 
-# ─────────────────────────────────────────────────────────────
-# Copy app
-# ─────────────────────────────────────────────────────────────
 COPY . .
+RUN chmod +x entrypoint.sh && chown -R node:node /app
 
-# ─────────────────────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────────────────────
-RUN chmod +x entrypoint.sh \
-    && chown -R node:node /app
-
-# ─────────────────────────────────────────────────────────────
-# Ports
-# ─────────────────────────────────────────────────────────────
 EXPOSE 6080
 EXPOSE 5900
 
-# ─────────────────────────────────────────────────────────────
-# Environment
-# ─────────────────────────────────────────────────────────────
 ENV DISPLAY=:99
 ENV PULSE_SINK=DiscordSink
 ENV PULSE_SOURCE=VirtualMic
-
-# IMPORTANT:
-# Higher latency = more stable realtime audio inside Docker
 ENV PULSE_LATENCY_MSEC=120
 
-# ─────────────────────────────────────────────────────────────
-# Use non-root user
-# ─────────────────────────────────────────────────────────────
 USER node
-
-# ─────────────────────────────────────────────────────────────
-# Start container
-# ─────────────────────────────────────────────────────────────
 ENTRYPOINT ["./entrypoint.sh"]
-```
