@@ -104,6 +104,21 @@ function isJoinVcIntent(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  COOKIE HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Playwright only accepts 'Strict' | 'Lax' | 'None'.
+// Cookie exporters (EditThisCookie, Cookie-Editor, etc.) often produce values
+// like 'no_restriction', 'lax', 'strict', 'unspecified', '', null, undefined.
+function normalizeSameSite(value) {
+  if (!value) return 'None';
+  switch (value.toLowerCase().replace(/[_\-\s]/g, '')) {
+    case 'strict':        return 'Strict';
+    case 'lax':           return 'Lax';
+    case 'none':
+    case 'norestriction': return 'None';
+    default:              return 'None';
+  }
+}
+
 function parseCookies(raw, domain) {
   if (!raw) return [];
   raw = raw.trim();
@@ -118,7 +133,7 @@ function parseCookies(raw, domain) {
         path:     c.path     || '/',
         secure:   c.secure   !== undefined ? c.secure : true,
         httpOnly: c.httpOnly !== undefined ? c.httpOnly : false,
-        sameSite: c.sameSite || 'None',
+        sameSite: normalizeSameSite(c.sameSite),
       }));
     } catch (e) {
       log('⚠️', 'Cookie JSON parse failed, trying raw string...');
@@ -135,7 +150,7 @@ function parseCookies(raw, domain) {
       path:     '/',
       secure:   true,
       httpOnly: false,
-      sameSite: 'None',
+      sameSite: normalizeSameSite(undefined),
     };
   }).filter(Boolean);
 }
@@ -192,6 +207,11 @@ function resetConversation(channelId) {
 //  BROWSER LAUNCH
 // ─────────────────────────────────────────────────────────────────────────────
 async function launchBrowser() {
+  // If the browser process died (e.g. OOM, crash), treat it as gone
+  if (browser) {
+    try { browser.contexts(); } // throws if browser is closed
+    catch (_) { cleanupBrowser(); }
+  }
   if (browser) return browserCtx;
   log('🌐', 'Launching browser...');
 
